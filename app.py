@@ -2,135 +2,106 @@ import streamlit as st
 import fitz  # PyMuPDF
 import re
 import pandas as pd
-import io
+from PIL import Image
+import pytesseract
 
-st.set_page_config(page_title="Extraction HBL de Desmos", layout="wide")
-st.title("📄 Extraction des actes HBL du fichier Desmos")
+st.set_page_config(page_title="Analyse Cosmident + Desmos", layout="wide")
+st.title("📄 Analyse des actes dentaires Cosmident + Desmos")
 
-desmos_file = st.file_uploader("Upload le fichier Desmos PDF", type=["pdf"])
+uploaded_cosmident = st.file_uploader("Upload le fichier Cosmident (PDF ou image)", type=["pdf", "png", "jpg", "jpeg"])
+uploaded_desmos = st.file_uploader("Upload le fichier Desmos (PDF)", type=["pdf"], key="desmos")
 
-def extract_hbl_data(file):
-    if not file:
-        return pd.DataFrame()  # Retourner un DataFrame vide si aucun fichier n'est uploadé
-    
-    # Vérifier si le fichier est vide
-    file_content = file.read()
-    if not file_content or len(file_content) == 0:
-        st.error("Le fichier uploadé est vide ou corrompu.")
-        return pd.DataFrame()
-    
-    # Réinitialiser le pointeur du fichier pour fitz
-    file.seek(0)
-    
-    # Ouvrir le PDF et extraire le texte
-    try:
-        doc = fitz.open(stream=file_content, filetype="pdf")
-    except Exception as e:
-        st.error(f"Erreur lors de l'ouverture du fichier : {e}")
-        return pd.DataFrame()
-    
+def extract_text_from_image(image):
+    return pytesseract.image_to_string(image)
+
+def extract_data_from_cosmident(file):
+    doc = fitz.open(stream=file.read(), filetype="pdf")
     full_text = ""
     for page in doc:
         full_text += page.get_text() + "\n"
     lines = full_text.split('\n')
-    
     results = []
     current_patient = None
-    state = "looking_for_patient"
-    current_block = []
-
     for line in lines:
-        line = line.strip()
-        if not line:
-            continue
+        ref_match = re.search(r'Ref\. ([\w\s\-]+)', line)
+        if ref_match:
+            current_patient = ref_match.group(1).strip()
+        price_match = re.search(r'(\d+\.\d{2}|\d+,\d{2})', line)
+        if current_patient and price_match:
+            price = price_match.group(1).replace(',', '.')
+            if float(price) > 0:
+                results.append({'Patient': current_patient, 'Acte Cosmident': line.strip(), 'Prix Cosmident': price})
+    return pd.DataFrame(results)
 
-        # Détecter le patient
-        if state == "looking_for_patient":
-            patient_match = re.match(r'([A-Z\s]+) N°INSEE : ([\d ]+)', line)
-            if patient_match:
-                current_patient = patient_match.group(1).strip()
-                state = "looking_for_data"
-                current_block = []
-            continue
+def extract_desmos_acts(file):
+    doc = fitz.open(stream=file.read(), filetype="pdf")
+    full_text = ""
+    for page in doc:
+        full_text += page.get_text() + "\n"
+    lines = full_text.split('\n')
+    st.subheader("Lignes brutes du PDF Desmos")
+    st.write(lines)
+    data = []
+    current_patient = None
+    current_acte = ""
+    current_hono = ""
+    for idx, line in enumerate(lines):
+        patient_match = re.search(r'Ref\. ([A-ZÉÈÇÂÊÎÔÛÄËÏÖÜÀÙa-zéèçâêîôûäëïöüàù\s\-]+)', line)
+        if patient_match:
+            if current_patient and current_acte and current_hono:
+                data.append({'Patient': current_patient, 'Acte Desmos': current_acte.strip(), 'Prix Desmos': current_hono})
+            current_patient = patient_match.group(1).strip()
+            current_acte = ""
+            current_hono = ""
+        elif current_patient:
+            if re.search(r'(BIOTECH|Couronne transvissée|HBL\w+|ZIRCONE|GOUTTIÈRE SOUPLE|EMAX|ONLAY|PLAQUE|ADJONCTION|MONTAGE|DENT RESINE)', line, re.IGNORECASE):
+                current_acte = line.strip()
+            hono_match = re.search(r'Hono\.?\s*:?\s*([\d,\.]+)', line)
+            if hono_match:
+                current_hono = hono_match.group(1).replace(',', '.')
+            price_match = re.search(r'(\d+\.\d{2}|\d+,\d{2})', line)
+            if not current_hono and price_match:
+                price = price_match.group(1).replace(',', '.')
+                if float(price) > 0:
+                    current_hono = price
+    if current_patient and current_acte and current_hono:
+        data.append({'Patient': current_patient, 'Acte Desmos': current_acte.strip(), 'Prix Desmos': current_hono})
+    return pd.DataFrame(data)
 
-        # Collecter les lignes du bloc de données
-        if state == "looking_for_data" and current_patient:
-            if line == "Total des Factures et Avoirs" or re.match(r'^\d{2}/\d{2}/\d{4}$', line):
-                # Fin du bloc ou nouvelle date, traiter le bloc précédent
-                if current_block:
-                    process_block(current_block, current_patient, results)
-                current_block = []
-            else:
-                current_block.append(line)
+def match_patient_and_acte(cosmident_patient, df_desmos):
+    cosmident_parts = set(cosmident_patient.lower().split())
+    for idx, row in df_desmos.iterrows():
+        desmos_patient = row['Patient']
+        desmos_parts = set(desmos_patient.lower().split())
+        if cosmident_patient.lower() == desmos_patient.lower() or len(cosmident_parts & desmos_parts) > 0:
+            return row['Acte Desmos'], row['Prix Desmos']
+    return "", ""
 
-        # Réinitialiser si fin de section
-        if line == "Total des Factures et Avoirs":
-            state = "looking_for_patient"
+if uploaded_cosmident and uploaded_desmos:
+    df_cosmident = extract_data_from_cosmident(uploaded_cosmident)
+    st.subheader("Tableau extrait Cosmident")
+    st.dataframe(df_cosmident)
 
-    # Traiter le dernier bloc s'il existe
-    if current_block and current_patient:
-        process_block(current_block, current_patient, results)
+    df_desmos = extract_desmos_acts(uploaded_desmos)
+    st.subheader("Tableau extrait Desmos (tous actes détectés)")
+    st.dataframe(df_desmos)
 
-    df = pd.DataFrame(results)
-    if not df.empty:
-        df['Tarif (Hono.)'] = df['Tarif (Hono.)'].str.replace(',', '.').astype(float)
-    return df
+    actes_desmos = []
+    prix_desmos = []
+    debug_match = []
+    for patient in df_cosmident['Patient']:
+        acte, prix = match_patient_and_acte(patient, df_desmos)
+        actes_desmos.append(acte)
+        prix_desmos.append(prix)
+        debug_match.append(f"Patient Cosmident: {patient} | Acte trouvé: {acte} | Prix trouvé: {prix}")
+    df_cosmident['Acte Desmos'] = actes_desmos
+    df_cosmident['Prix Desmos'] = prix_desmos
 
-def process_block(block, patient, results):
-    i = 0
-    while i < len(block):
-        line = block[i].strip()
-        # Chercher un code HBL dans Cot.+Coef. (5e colonne après Date, N° Fact., Type, Dent(s))
-        if re.match(r'^\d{2}/\d{2}/\d{4}$', line):  # Début d'une nouvelle entrée (Date)
-            i += 1
-            if i < len(block):
-                fact_num = block[i].strip()  # N° Fact.
-                i += 1
-            if i < len(block):
-                fse_type = block[i].strip()  # Type et N° FSE
-                i += 1
-            if i < len(block):
-                dents = block[i].strip()  # Dent(s)
-                i += 1
-            if i < len(block):
-                cot_coef = block[i].strip()  # Cot.+Coef.
-                i += 1
-                # Vérifier si Cot.+Coef. commence par HBL (ex. HBLD474)
-                if re.match(r'^HBL\d{3}$', cot_coef):
-                    # Rassembler l'acte (lignes suivantes jusqu'à Hono)
-                    act_lines = []
-                    hono = None
-                    while i < len(block):
-                        next_line = block[i].strip()
-                        if re.match(r'^\d+,\d{2}$', next_line):  # Trouver Hono
-                            hono = next_line
-                            break
-                        act_lines.append(next_line)
-                        i += 1
-                    if hono:
-                        act = ' '.join(act_lines).strip() if act_lines else cot_coef
-                        results.append({
-                            'Nom Patient': patient,
-                            'Acte': act,
-                            'Tarif (Hono.)': hono
-                        })
-        i += 1
+    st.subheader("Debug correspondances patient Cosmident / Desmos")
+    st.write(debug_match)
 
-if desmos_file:
-    df = extract_hbl_data(desmos_file)
-    if not df.empty:
-        st.success("✅ Extraction terminée")
-        st.dataframe(df, use_container_width=True)
-    else:
-        st.warning("Aucune donnée HBL trouvée dans le fichier.")
-        st.subheader("Texte extrait pour débogage :")
-        # Réinitialiser le fichier pour le débogage
-        desmos_file.seek(0)
-        try:
-            doc = fitz.open(stream=desmos_file.read(), filetype="pdf")
-            full_text = ""
-            for page in doc:
-                full_text += page.get_text() + "\n"
-            st.text(full_text)  # Afficher le texte brut pour débogage
-        except Exception as e:
-            st.error(f"Erreur lors de l'extraction du texte : {e}")
+    st.success("✅ Extraction et fusion terminées")
+    st.subheader("Tableau fusionné final")
+    st.dataframe(df_cosmident, use_container_width=True)
+else:
+    st.info("Veuillez charger les deux fichiers PDF (Cosmident et Desmos) pour lancer l'analyse.")
