@@ -2,15 +2,14 @@ import streamlit as st
 import fitz  # PyMuPDF
 import re
 import pandas as pd
-import io
 
 # Configuration Streamlit
 st.set_page_config(page_title="Récapitulatif HBL Patients et Tarifs", layout="wide")
-st.title("🏥 Récapitulatif détaillé des actes HBL (hors codes exclus) du fichier Desmos")
+st.title("🏥 Récapitulatif détaillé des actes HBL (montants exacts) du fichier Desmos")
 
 
 def extract_hbl_data(file):
-    """Extrait les actes dont le code commence par HBL, un acte = une ligne, en excluant certains codes."""
+    """Extrait les actes HBL (une ligne par acte) avec le montant exact associé."""
     if not file:
         return pd.DataFrame()
 
@@ -26,14 +25,14 @@ def extract_hbl_data(file):
         st.error(f"Erreur lors de l'ouverture du fichier : {e}")
         return pd.DataFrame()
 
-    # Extraction texte
+    # Extraction texte complet
     full_text = ""
     for page in doc:
         full_text += page.get_text("text") + "\n"
 
     lines = [l.strip() for l in full_text.split("\n") if l.strip()]
 
-    # --- Codes à exclure ---
+    # --- Codes HBL à exclure ---
     excluded_codes = {"HBLD073", "HBLD490", "HBLD724"}
 
     data = []
@@ -77,31 +76,25 @@ def extract_hbl_data(file):
                 if re.match(r"^\d", desc_line):
                     desc_line = ""
 
-            # Cherche Cot.+Coef. avant le code
-            coef_value = None
-            for j in range(i - 5, i):
-                if j < 0:
-                    continue
-                coef_match = re.findall(r"\b\d+,\d{2}\b", lines[j])
-                if coef_match:
-                    coef_value = coef_match[0].replace(",", ".")
-                    break
-
-            # Cherche montant Hono (sur même ligne ou juste après)
+            # --- Recherche du montant Hono. ---
             hono_value = None
-            for k in range(i, min(i + 4, len(lines))):
+
+            # Regarder sur la même ligne puis dans les 3 suivantes
+            for k in range(i, min(i + 5, len(lines))):
                 montant_match = re.findall(r"\d+,\d{2}", lines[k])
                 if montant_match:
-                    hono_value = montant_match[-1].replace(",", ".")
-                    break
+                    # On prend le plus grand montant de la ligne comme "Hono."
+                    montant_floats = [float(m.replace(",", ".")) for m in montant_match]
+                    if montant_floats:
+                        hono_value = max(montant_floats)
+                        break
 
-            # Ajoute la ligne
+            # Ajout d'une ligne par acte HBL
             data.append({
                 "Nom Patient": current_patient,
                 "Code HBL": code,
                 "Description": desc_line if desc_line else "(non trouvée)",
-                "Cot.+Coef.": coef_value if coef_value else "",
-                "Hono.": float(hono_value) if hono_value else None
+                "Hono.": hono_value if hono_value else None
             })
 
     # --- Conversion en DataFrame ---
@@ -109,6 +102,9 @@ def extract_hbl_data(file):
         return pd.DataFrame()
 
     df = pd.DataFrame(data)
+
+    # Nettoyage : suppression des lignes sans montant
+    df = df[df["Hono."].notnull()]
     df = df.sort_values(by=["Nom Patient"]).reset_index(drop=True)
     return df
 
@@ -120,14 +116,15 @@ if desmos_file:
     df = extract_hbl_data(desmos_file)
 
     if not df.empty:
-        st.success(f"✅ {len(df)} actes HBL trouvés (hors codes exclus) pour {df['Nom Patient'].nunique()} patients")
+        st.success(f"✅ {len(df)} actes HBL trouvés pour {df['Nom Patient'].nunique()} patients")
         st.dataframe(df, use_container_width=True)
 
+        # Téléchargement CSV
         csv = df.to_csv(index=False).encode("utf-8")
         st.download_button(
-            "⬇️ Télécharger le récapitulatif HBL (codes filtrés) en CSV",
+            "⬇️ Télécharger le récapitulatif HBL (montants exacts) en CSV",
             csv,
-            "recapitulatif_HBL_filtre.csv",
+            "recapitulatif_HBL_montants.csv",
             "text/csv"
         )
     else:
