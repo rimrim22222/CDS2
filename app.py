@@ -1,42 +1,126 @@
 import streamlit as st
-import fitz
+import fitz  # PyMuPDF
 import re
 import pandas as pd
+import io
 
-st.set_page_config(page_title="Analyse actes Desmos", layout="wide")
-st.title("📄 Extraction des actes du fichier Desmos")
+# Configuration de la page
+st.set_page_config(page_title="Récapitulatif des Patients et Tarifs", layout="wide")
+st.title("📊 Récapitulatif des Patients et Tarifs du fichier Desmos")
 
-uploaded_desmos = st.file_uploader("Upload le fichier Desmos (PDF)", type=["pdf"], key="desmos")
+# Upload du fichier PDF
+desmos_file = st.file_uploader("📄 Upload le fichier Desmos PDF", type=["pdf"])
 
-def extract_desmos_acts(file):
-    doc = fitz.open(stream=file.read(), filetype="pdf")
+
+def extract_patient_totals(file):
+    """Extrait les patients, actes et totaux honoraires du PDF Desmos."""
+    if not file:
+        return pd.DataFrame()
+
+    file_content = file.read()
+    if not file_content or len(file_content) == 0:
+        st.error("Le fichier uploadé est vide ou corrompu.")
+        return pd.DataFrame()
+
+    file.seek(0)
+    try:
+        doc = fitz.open(stream=file_content, filetype="pdf")
+    except Exception as e:
+        st.error(f"Erreur lors de l'ouverture du fichier : {e}")
+        return pd.DataFrame()
+
     full_text = ""
     for page in doc:
-        full_text += page.get_text() + "\n"
-    lines = full_text.split('\n')
-    data = []
-    current_patient = None
-    for idx, line in enumerate(lines):
-        patient_match = re.search(r'Ref\. ([A-ZÉÈÇÂÊÎÔÛÄËÏÖÜÀÙa-zéèçâêîôûäëïöüàù\s\-]+)', line)
-        if patient_match:
-            current_patient = patient_match.group(1).strip()
-        # Cherche un intitulé d'acte (ex : BIOTECH, Couronne, HBL, ZIRCONE, etc.)
-        if current_patient and re.search(r'(BIOTECH|Couronne|HBL\w+|ZIRCONE|GOUTTIÈRE SOUPLE|EMAX|ONLAY|PLAQUE|ADJONCTION|MONTAGE|DENT RESINE)', line, re.IGNORECASE):
-            acte = line.strip()
-            # Cherche prix sur la même ligne ou la suivante
-            price_match = re.search(r'(\d+\.\d{2}|\d+,\d{2})', line)
-            prix = price_match.group(1).replace(',', '.') if price_match else ""
-            if not prix and idx + 1 < len(lines):
-                next_line = lines[idx + 1]
-                price_match = re.search(r'(\d+\.\d{2}|\d+,\d{2})', next_line)
-                if price_match:
-                    prix = price_match.group(1).replace(',', '.')
-            data.append({'Patient': current_patient, 'Acte': acte, 'Prix': prix})
-    return pd.DataFrame(data)
+        full_text += page.get_text("text") + "\n"
 
-if uploaded_desmos:
-    df_desmos = extract_desmos_acts(uploaded_desmos)
-    st.success("✅ Extraction terminée")
-    st.dataframe(df_desmos, use_container_width=True)
-else:
-    st.info("Veuillez charger le fichier PDF Desmos pour lancer l'analyse.")
+    # Nettoyage du texte
+    lines = [l.strip() for l in full_text.split("\n") if l.strip()]
+
+    patient_data = {}
+    current_patient = None
+    current_actes = []
+    current_total = 0.0
+    capture_acte = False
+
+    for line in lines:
+        # --- Détection du patient ---
+        match_patient = re.match(r"([A-ZÉÈÀÙÂÊÎÔÛÇ'\- ]+) N°INSEE\s*:\s*([\d ]+)", line)
+        if match_patient:
+            # Sauvegarder le patient précédent avant de passer au suivant
+            if current_patient:
+                patient_data[current_patient] = {
+                    "Actes": "; ".join(current_actes) if current_actes else "Aucun acte trouvé",
+                    "Total Tarif (Hono.)": round(current_total, 2)
+                }
+            current_patient = match_patient.group(1).strip()
+            current_actes = []
+            current_total = 0.0
+            capture_acte = False
+            continue
+
+        # --- Début d’un bloc d’actes ---
+        if re.match(r"^\d{2}/\d{2}/\d{4}", line):
+            capture_acte = True
+            continue
+
+        # --- Fin d’un bloc d’actes ---
+        if "Total Facture" in line or "Total des Factures et Avoirs" in line:
+            capture_acte = False
+            continue
+
+        # --- Si on est dans un bloc d’actes ---
+        if capture_acte:
+            # Recherche d’un montant
+            montant_match = re.findall(r"\d+,\d{2}", line)
+            if montant_match:
+                try:
+                    # On prend la dernière valeur numérique trouvée
+                    montant = float(montant_match[-1].replace(",", "."))
+                    current_total += montant
+                except ValueError:
+                    pass
+
+            # Détection d’un libellé d’acte (ligne textuelle sans code ni montant)
+            if not re.match(r"^[\d,\. ]+$", line) and len(line) > 3 and not line.startswith("HB"):
+                if not any(word in line.lower() for word in ["total facture", "facture", "sécurisée", "fse"]):
+                    current_actes.append(line)
+
+    # --- Sauvegarder le dernier patient ---
+    if current_patient:
+        patient_data[current_patient] = {
+            "Actes": "; ".join(current_actes) if current_actes else "Aucun acte trouvé",
+            "Total Tarif (Hono.)": round(current_total, 2)
+        }
+
+    # --- Conversion en DataFrame ---
+    if patient_data:
+        df = pd.DataFrame.from_dict(patient_data, orient="index").reset_index()
+        df = df.rename(columns={"index": "Nom Patient"})
+        return df
+    return pd.DataFrame()
+
+
+# --- Exécution principale ---
+if desmos_file:
+    df = extract_patient_totals(desmos_file)
+
+    if not df.empty:
+        st.success("✅ Extraction terminée avec succès")
+        st.dataframe(df[['Nom Patient', 'Actes', 'Total Tarif (Hono.)']], use_container_width=True)
+
+        # Téléchargement CSV
+        csv = df.to_csv(index=False).encode('utf-8')
+        st.download_button("⬇️ Télécharger le récapitulatif en CSV", csv, "recapitulatif_patients.csv", "text/csv")
+
+    else:
+        st.warning("⚠️ Aucune donnée de patient ou d'acte trouvée dans le fichier.")
+        st.subheader("🧩 Texte extrait pour débogage :")
+        desmos_file.seek(0)
+        try:
+            doc = fitz.open(stream=desmos_file.read(), filetype="pdf")
+            full_text = ""
+            for page in doc:
+                full_text += page.get_text() + "\n"
+            st.text(full_text[:2000])  # Afficher les 2000 premiers caractères pour inspection
+        except Exception as e:
+            st.error(f"Erreur lors de l'extraction du texte : {e}")
