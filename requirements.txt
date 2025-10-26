@@ -3,3 +3,4 @@ pymupdf
 pandas
 pytesseract
 io
+re
