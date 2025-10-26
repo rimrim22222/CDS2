@@ -2,6 +2,7 @@ import streamlit as st
 import fitz  # PyMuPDF
 import re
 import pandas as pd
+import io
 
 st.set_page_config(page_title="Extraction HBL de Desmos", layout="wide")
 st.title("📄 Extraction des actes HBL du fichier Desmos")
@@ -12,8 +13,17 @@ def extract_hbl_data(file):
     if not file:
         return pd.DataFrame()  # Retourner un DataFrame vide si aucun fichier n'est uploadé
     
+    # Vérifier si le fichier est vide
+    file_content = file.read()
+    if not file_content or len(file_content) == 0:
+        st.error("Le fichier uploadé est vide ou corrompu.")
+        return pd.DataFrame()
+    
+    # Réinitialiser le pointeur du fichier pour fitz
+    file.seek(0)
+    
     # Ouvrir le PDF et extraire le texte
-    doc = fitz.open(stream=file.read(), filetype="pdf")
+    doc = fitz.open(stream=file_content, filetype="pdf")
     full_text = ""
     for page in doc:
         full_text += page.get_text() + "\n"
@@ -108,6 +118,8 @@ if desmos_file:
     else:
         st.warning("Aucune donnée HBL trouvée dans le fichier.")
         st.subheader("Texte extrait pour débogage :")
+        # Réinitialiser le fichier pour le débogage
+        desmos_file.seek(0)
         doc = fitz.open(stream=desmos_file.read(), filetype="pdf")
         full_text = ""
         for page in doc:
