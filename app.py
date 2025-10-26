@@ -6,11 +6,11 @@ import io
 
 # Configuration Streamlit
 st.set_page_config(page_title="Récapitulatif HBL Patients et Tarifs", layout="wide")
-st.title("🏥 Récapitulatif détaillé des actes HBL (Couronnes, Bridges...) du fichier Desmos")
+st.title("🏥 Récapitulatif détaillé des actes HBL (hors codes exclus) du fichier Desmos")
 
 
 def extract_hbl_data(file):
-    """Extrait les actes dont le code commence par HBL, un acte = une ligne."""
+    """Extrait les actes dont le code commence par HBL, un acte = une ligne, en excluant certains codes."""
     if not file:
         return pd.DataFrame()
 
@@ -26,12 +26,15 @@ def extract_hbl_data(file):
         st.error(f"Erreur lors de l'ouverture du fichier : {e}")
         return pd.DataFrame()
 
-    # Extraire le texte
+    # Extraction texte
     full_text = ""
     for page in doc:
         full_text += page.get_text("text") + "\n"
 
     lines = [l.strip() for l in full_text.split("\n") if l.strip()]
+
+    # --- Codes à exclure ---
+    excluded_codes = {"HBLD073", "HBLD490", "HBLD724"}
 
     data = []
     current_patient = None
@@ -50,7 +53,7 @@ def extract_hbl_data(file):
             capture_acte = True
             continue
 
-        # --- Fin du bloc d’actes ---
+        # --- Fin d’un bloc d’actes ---
         if "Total Facture" in line or "Total des Factures et Avoirs" in line:
             capture_acte = False
             continue
@@ -63,15 +66,18 @@ def extract_hbl_data(file):
         if match_hbl:
             code = match_hbl.group(1)
 
+            # ⚠️ Exclure les codes indésirables
+            if code in excluded_codes:
+                continue
+
             # Cherche description juste avant
             desc_line = ""
             if i > 0:
                 desc_line = lines[i - 1].strip()
-                # Nettoyage : éviter de récupérer une ligne de montant
                 if re.match(r"^\d", desc_line):
                     desc_line = ""
 
-            # Cherche Cot.+Coef. dans les lignes précédentes
+            # Cherche Cot.+Coef. avant le code
             coef_value = None
             for j in range(i - 5, i):
                 if j < 0:
@@ -81,7 +87,7 @@ def extract_hbl_data(file):
                     coef_value = coef_match[0].replace(",", ".")
                     break
 
-            # Cherche montant Hono (souvent sur même ligne ou juste après)
+            # Cherche montant Hono (sur même ligne ou juste après)
             hono_value = None
             for k in range(i, min(i + 4, len(lines))):
                 montant_match = re.findall(r"\d+,\d{2}", lines[k])
@@ -103,7 +109,6 @@ def extract_hbl_data(file):
         return pd.DataFrame()
 
     df = pd.DataFrame(data)
-    # Trier par patient pour lisibilité
     df = df.sort_values(by=["Nom Patient"]).reset_index(drop=True)
     return df
 
@@ -115,16 +120,15 @@ if desmos_file:
     df = extract_hbl_data(desmos_file)
 
     if not df.empty:
-        st.success(f"✅ {len(df)} actes HBL trouvés pour {df['Nom Patient'].nunique()} patients")
+        st.success(f"✅ {len(df)} actes HBL trouvés (hors codes exclus) pour {df['Nom Patient'].nunique()} patients")
         st.dataframe(df, use_container_width=True)
 
-        # Téléchargement CSV
         csv = df.to_csv(index=False).encode("utf-8")
         st.download_button(
-            "⬇️ Télécharger le récapitulatif HBL détaillé en CSV",
+            "⬇️ Télécharger le récapitulatif HBL (codes filtrés) en CSV",
             csv,
-            "recapitulatif_HBL_detail.csv",
+            "recapitulatif_HBL_filtre.csv",
             "text/csv"
         )
     else:
-        st.warning("⚠️ Aucun acte HBL trouvé dans le fichier.")
+        st.warning("⚠️ Aucun acte HBL valide trouvé dans le fichier.")
