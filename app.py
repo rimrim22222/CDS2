@@ -23,7 +23,12 @@ def extract_hbl_data(file):
     file.seek(0)
     
     # Ouvrir le PDF et extraire le texte
-    doc = fitz.open(stream=file_content, filetype="pdf")
+    try:
+        doc = fitz.open(stream=file_content, filetype="pdf")
+    except Exception as e:
+        st.error(f"Erreur lors de l'ouverture du fichier : {e}")
+        return pd.DataFrame()
+    
     full_text = ""
     for page in doc:
         full_text += page.get_text() + "\n"
@@ -90,6 +95,7 @@ def process_block(block, patient, results):
             if i < len(block):
                 cot_coef = block[i].strip()  # Cot.+Coef.
                 i += 1
+                # Vérifier si Cot.+Coef. commence par HBL (ex. HBLD474)
                 if re.match(r'^HBL\d{3}$', cot_coef):
                     # Rassembler l'acte (lignes suivantes jusqu'à Hono)
                     act_lines = []
@@ -120,8 +126,11 @@ if desmos_file:
         st.subheader("Texte extrait pour débogage :")
         # Réinitialiser le fichier pour le débogage
         desmos_file.seek(0)
-        doc = fitz.open(stream=desmos_file.read(), filetype="pdf")
-        full_text = ""
-        for page in doc:
-            full_text += page.get_text() + "\n"
-        st.text(full_text)  # Afficher le texte brut pour débogage
+        try:
+            doc = fitz.open(stream=desmos_file.read(), filetype="pdf")
+            full_text = ""
+            for page in doc:
+                full_text += page.get_text() + "\n"
+            st.text(full_text)  # Afficher le texte brut pour débogage
+        except Exception as e:
+            st.error(f"Erreur lors de l'extraction du texte : {e}")
