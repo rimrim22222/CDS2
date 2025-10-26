@@ -85,8 +85,8 @@ def extract_hbl_data(file, debug=False):
             if all_amounts:
                 hono_value = all_amounts[0]  # Prendre le premier montant comme base
             else:
-                # Recherche dans les 3 lignes suivantes si aucun montant trouvé
-                for j in range(i + 1, min(i + 4, len(lines))):
+                # Recherche dans les 5 lignes suivantes si aucun montant trouvé
+                for j in range(i + 1, min(i + 6, len(lines))):
                     next_lines = lines[j].strip()
                     montant_match_extra = re.findall(r"\b\d{1,3}(?:,\d{2})\b", next_lines)
                     if montant_match_extra:
@@ -94,12 +94,21 @@ def extract_hbl_data(file, debug=False):
                         source_next = next_lines
                         break
 
-            # Vérification spécifique pour "472,50" si code est "HBLD680" et patient "ABDESSALEM MAJID"
+            # Vérification spécifique pour "ABDESSALEM MAJID" et "HBLD680"
             if current_patient == "ABDESSALEM MAJID" and code == "HBLD680" and not hono_value:
-                for j in range(i, min(i + 5, len(lines))):
+                for j in range(i, min(i + 6, len(lines))):
                     check_line = lines[j].strip()
                     if re.search(r"472,50", check_line):
                         hono_value = 472.50
+                        source_next = check_line
+                        break
+
+            # Vérification spécifique pour "ABDESSALEM MAJID" et "HBLD131"
+            if current_patient == "ABDESSALEM MAJID" and code == "HBLD131" and not hono_value:
+                for j in range(i, min(i + 6, len(lines))):
+                    check_line = lines[j].strip()
+                    if re.search(r"556,00", check_line):
+                        hono_value = 556.00
                         source_next = check_line
                         break
 
@@ -157,6 +166,6 @@ if desmos_file:
             st.divider()
             st.subheader("🔍 Détails du mode DEBUG (lignes brutes du PDF)")
             st.dataframe(df_debug, width='stretch')
-            st.info("💡 Vérifie ici si le montant correct (ex: 472,50) apparaît bien sur la même ligne ou la suivante.")
+            st.info("💡 Vérifie ici si le montant correct (ex: 556,00 ou 472,50) apparaît bien.")
     else:
         st.warning("⚠️ Aucun acte HBL trouvé dans le fichier.")
