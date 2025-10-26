@@ -54,20 +54,41 @@ def extract_patient_data(file):
             i += 1
             continue
 
-        # Rechercher les codes HBL et tarifs Hono pour le patient actuel
-        if current_patient:
-            # Vérifier si la ligne contient un code HBL
-            if re.match(r'^HBL[A-Z]\d{3}$', line):
-                current_codes.append(line)
+        # Rechercher une structure de ligne avec Cot.+Coef.
+        if current_patient and re.match(r'^\d{2}/\d{2}/\d{4}$', line):  # Date
+            j = i + 1
+            cot_coef = None
+            hono = None
             
-            # Accumuler les tarifs Hono
-            if re.match(r'^\d+,\d{2}$', line):
-                try:
-                    hono_value = float(line.replace(',', '.'))
-                    current_hono += hono_value
-                except ValueError:
-                    pass
+            # Parcourir les colonnes potentielles
+            column_count = 0
+            while j < len(lines) and column_count < 5:
+                next_line = lines[j].strip()
+                if next_line and not re.match(r'^\s*$', next_line):
+                    if column_count == 4:  # 5e colonne = Cot.+Coef.
+                        cot_coef = next_line
+                        if re.match(r'^HBL[A-Z]\d{3}$', cot_coef):
+                            current_codes.append(cot_coef)
+                    j += 1
+                    column_count += 1
+                else:
+                    j += 1
             
+            # Chercher le tarif Hono dans les lignes suivantes
+            k = j
+            while k < min(j + 6, len(lines)):
+                hono_line = lines[k].strip()
+                if re.match(r'^\d+,\d{2}$', hono_line):
+                    try:
+                        hono_value = float(hono_line.replace(',', '.'))
+                        current_hono += hono_value
+                    except ValueError:
+                        pass
+                    break
+                k += 1
+            
+            i = k if hono else j
+        else:
             i += 1
 
     # Ajouter le dernier patient s'il a des données
@@ -98,6 +119,6 @@ if desmos_file:
             full_text = ""
             for page in doc:
                 full_text += page.get_text() + "\n"
-            st.text(full_text[:2000])  # Afficher les 2000 premiers caractères pour plus de contexte
+            st.text(full_text[:1000])  # Limiter à 1000 caractères pour lisibilité
         except Exception as e:
             st.error(f"Erreur lors de l'extraction du texte : {e}")
