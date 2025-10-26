@@ -65,9 +65,11 @@ def extract_patient_totals(file):
             
             # Parcourir jusqu'à la 5e colonne non vide
             column_count = 0
+            current_columns = []
             while j < len(lines) and column_count < 5:
                 next_line = lines[j].strip()
                 if next_line and not re.match(r'^\s*$', next_line):
+                    current_columns.append(next_line)
                     if column_count == 4:  # 5e colonne = Acte
                         acte = next_line
                         if acte:
@@ -76,6 +78,9 @@ def extract_patient_totals(file):
                     column_count += 1
                 else:
                     j += 1
+            
+            # Afficher les colonnes pour débogage (optionnel, à commenter si pas nécessaire)
+            # st.write(f"Colonnes pour date {line}: {current_columns}")
             
             # Chercher le tarif Hono dans les lignes suivantes
             k = j
