@@ -4,12 +4,12 @@ import re
 import pandas as pd
 import io
 
-st.set_page_config(page_title="Extraction HBL de Desmos", layout="wide")
-st.title("📄 Extraction des actes HBL du fichier Desmos")
+st.set_page_config(page_title="Récapitulatif des Patients et Tarifs", layout="wide")
+st.title("📊 Récapitulatif des Patients et Tarifs du fichier Desmos")
 
 desmos_file = st.file_uploader("Upload le fichier Desmos PDF", type=["pdf"])
 
-def extract_hbl_data(file):
+def extract_patient_totals(file):
     if not file:
         return pd.DataFrame()
     
@@ -31,88 +31,49 @@ def extract_hbl_data(file):
         full_text += page.get_text() + "\n"
     lines = full_text.split('\n')
     
-    results = []
+    patient_totals = {}
     current_patient = None
-    state = "looking_for_patient"
-    current_block = []
+    current_hono = 0.0
 
     for line in lines:
         line = line.strip()
         if not line:
             continue
 
-        if state == "looking_for_patient":
-            patient_match = re.match(r'([A-Z\s]+) N°INSEE : ([\d ]+)', line)
-            if patient_match:
-                current_patient = patient_match.group(1).strip()
-                state = "looking_for_data"
-                current_block = []
+        # Détecter le patient
+        patient_match = re.match(r'([A-Z\s]+) N°INSEE : ([\d ]+)', line)
+        if patient_match:
+            if current_patient and current_hono > 0:
+                patient_totals[current_patient] = current_hono
+            current_patient = patient_match.group(1).strip()
+            current_hono = 0.0
             continue
 
-        if state == "looking_for_data" and current_patient:
-            if line == "Total des Factures et Avoirs" or re.match(r'^\d{2}/\d{2}/\d{4}$', line):
-                if current_block:
-                    process_block(current_block, current_patient, results)
-                current_block = []
-            else:
-                current_block.append(line)
+        # Accumuler les tarifs Hono pour le patient actuel
+        if current_patient and re.match(r'^\d+,\d{2}$', line):
+            try:
+                hono_value = float(line.replace(',', '.'))
+                current_hono += hono_value
+            except ValueError:
+                continue
 
-        if line == "Total des Factures et Avoirs":
-            state = "looking_for_patient"
+    # Ajouter le dernier patient s'il a des tarifs
+    if current_patient and current_hono > 0:
+        patient_totals[current_patient] = current_hono
 
-    if current_block and current_patient:
-        process_block(current_block, current_patient, results)
-
-    df = pd.DataFrame(results)
-    if not df.empty:
-        df['Tarif (Hono.)'] = df['Tarif (Hono.)'].str.replace(',', '.').astype(float)
-    return df
-
-def process_block(block, patient, results):
-    i = 0
-    while i < len(block):
-        line = block[i].strip()
-        if re.match(r'^\d{2}/\d{2}/\d{4}$', line):  # Date
-            i += 1
-            if i < len(block):
-                fact_num = block[i].strip()  # N° Fact.
-                i += 1
-            if i < len(block):
-                fse_type = block[i].strip()  # Type et N° FSE
-                i += 1
-            if i < len(block):
-                dents = block[i].strip()  # Dent(s)
-                i += 1
-            if i < len(block):
-                cot_coef = block[i].strip()  # Cot.+Coef.
-                i += 1
-                if re.match(r'^HBL[A-Z]\d{3}$', cot_coef):  # Adjusted regex for HBLD474, etc.
-                    act_lines = []
-                    hono = None
-                    while i < len(block):
-                        next_line = block[i].strip()
-                        if re.match(r'^\d+,\d{2}$', next_line):
-                            hono = next_line
-                            break
-                        act_lines.append(next_line)
-                        i += 1
-                    if hono:
-                        act = ' '.join(act_lines).strip() if act_lines else cot_coef
-                        results.append({
-                            'Nom Patient': patient,
-                            'Acte': act,
-                            'Code': cot_coef,
-                            'Tarif (Hono.)': hono
-                        })
-        i += 1
+    # Convertir en DataFrame
+    if patient_totals:
+        df = pd.DataFrame(list(patient_totals.items()), columns=['Nom Patient', 'Total Tarif (Hono.)'])
+        return df
+    return pd.DataFrame()
 
 if desmos_file:
-    df = extract_hbl_data(desmos_file)
+    df = extract_patient_totals(desmos_file)
     if not df.empty:
-        st.success("✅ Extraction terminée")
-        st.dataframe(df[['Nom Patient', 'Acte', 'Code', 'Tarif (Hono.)']], use_container_width=True)
+        st.success("✅ Récapitulatif terminé")
+        st.dataframe(df, use_container_width=True)
     else:
-        st.warning("Aucune donnée HBL trouvée dans le fichier.")
+        st.warning("Aucune donnée de patient ou tarif trouvée dans le fichier.")
         st.subheader("Texte extrait pour débogage :")
         desmos_file.seek(0)
         try:
