@@ -110,9 +110,7 @@ if desmos_file:
     df = extract_hbl_data(desmos_file)
     if not df.empty:
         st.success("✅ Extraction terminée")
-        for patient, group in df.groupby('Nom Patient'):
-            st.subheader(f"Tableau pour {patient}")
-            st.dataframe(group[['Acte', 'Code', 'Tarif (Hono.)']], use_container_width=True)
+        st.dataframe(df[['Nom Patient', 'Acte', 'Code', 'Tarif (Hono.)']], use_container_width=True)
     else:
         st.warning("Aucune donnée HBL trouvée dans le fichier.")
         st.subheader("Texte extrait pour débogage :")
