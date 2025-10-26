@@ -3,13 +3,12 @@ import fitz  # PyMuPDF
 import re
 import pandas as pd
 
-# Configuration Streamlit
 st.set_page_config(page_title="Récapitulatif HBL Patients et Tarifs", layout="wide")
-st.title("🏥 Récapitulatif détaillé des actes HBL (montants exacts) du fichier Desmos")
+st.title("🏥 Récapitulatif précis des actes HBL et montants totaux du fichier Desmos")
 
 
 def extract_hbl_data(file):
-    """Extrait les actes HBL (une ligne par acte) avec le montant exact associé."""
+    """Extrait les actes HBL (une ligne par acte) avec le bon montant total correspondant."""
     if not file:
         return pd.DataFrame()
 
@@ -25,16 +24,14 @@ def extract_hbl_data(file):
         st.error(f"Erreur lors de l'ouverture du fichier : {e}")
         return pd.DataFrame()
 
-    # Extraction texte complet
+    # Lecture de tout le texte
     full_text = ""
     for page in doc:
         full_text += page.get_text("text") + "\n"
 
     lines = [l.strip() for l in full_text.split("\n") if l.strip()]
 
-    # --- Codes HBL à exclure ---
     excluded_codes = {"HBLD073", "HBLD490", "HBLD724"}
-
     data = []
     current_patient = None
     capture_acte = False
@@ -64,32 +61,36 @@ def extract_hbl_data(file):
         match_hbl = re.match(r"^(HBL[A-Z0-9]+)", line)
         if match_hbl:
             code = match_hbl.group(1)
-
-            # ⚠️ Exclure les codes indésirables
             if code in excluded_codes:
                 continue
 
-            # Cherche description juste avant
+            # Description (souvent la ligne précédente)
             desc_line = ""
             if i > 0:
                 desc_line = lines[i - 1].strip()
                 if re.match(r"^\d", desc_line):
                     desc_line = ""
 
-            # --- Recherche du montant Hono. ---
             hono_value = None
 
-            # Regarder sur la même ligne puis dans les 3 suivantes
-            for k in range(i, min(i + 5, len(lines))):
-                montant_match = re.findall(r"\d+,\d{2}", lines[k])
-                if montant_match:
-                    # On prend le plus grand montant de la ligne comme "Hono."
-                    montant_floats = [float(m.replace(",", ".")) for m in montant_match]
-                    if montant_floats:
-                        hono_value = max(montant_floats)
+            # --- Recherche du montant total ("Total Facture") ---
+            for k in range(i, min(i + 10, len(lines))):
+                if "Total Facture" in lines[k]:
+                    montant_match = re.findall(r"\d+,\d{2}", lines[k])
+                    if montant_match:
+                        hono_value = float(montant_match[-1].replace(",", "."))
                         break
 
-            # Ajout d'une ligne par acte HBL
+            # --- Si pas trouvé, on cherche le plus grand montant dans les 5 lignes suivantes ---
+            if hono_value is None:
+                all_amounts = []
+                for k in range(i, min(i + 5, len(lines))):
+                    montant_match = re.findall(r"\d+,\d{2}", lines[k])
+                    all_amounts += [float(m.replace(",", ".")) for m in montant_match]
+                if all_amounts:
+                    hono_value = max(all_amounts)
+
+            # --- Enregistrement ---
             data.append({
                 "Nom Patient": current_patient,
                 "Code HBL": code,
@@ -97,13 +98,10 @@ def extract_hbl_data(file):
                 "Hono.": hono_value if hono_value else None
             })
 
-    # --- Conversion en DataFrame ---
     if not data:
         return pd.DataFrame()
 
     df = pd.DataFrame(data)
-
-    # Nettoyage : suppression des lignes sans montant
     df = df[df["Hono."].notnull()]
     df = df.sort_values(by=["Nom Patient"]).reset_index(drop=True)
     return df
@@ -122,10 +120,10 @@ if desmos_file:
         # Téléchargement CSV
         csv = df.to_csv(index=False).encode("utf-8")
         st.download_button(
-            "⬇️ Télécharger le récapitulatif HBL (montants exacts) en CSV",
+            "⬇️ Télécharger le récapitulatif HBL (montants totaux) en CSV",
             csv,
-            "recapitulatif_HBL_montants.csv",
+            "recapitulatif_HBL_montants_totaux.csv",
             "text/csv"
         )
     else:
-        st.warning("⚠️ Aucun acte HBL valide trouvé dans le fichier.")
+        st.warning("⚠️ Aucun acte HBL trouvé dans le fichier.")
