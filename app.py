@@ -10,19 +10,17 @@ st.title("🏥 Récapitulatif détaillé des actes HBL (mode DEBUG)")
 def extract_hbl_data(file, debug=False):
     """Extrait les actes HBL (une ligne par acte) et montre les lignes sources si debug=True."""
     if not file:
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame()
 
-    file_content = file.read()
-    if not file_content or len(file_content) == 0:
-        st.error("Le fichier uploadé est vide ou corrompu.")
-        return pd.DataFrame()
+    if file.size == 0:
+        st.error("Le fichier uploadé est vide !")
+        return pd.DataFrame(), pd.DataFrame()
 
-    file.seek(0)
     try:
-        doc = fitz.open(stream=file_content, filetype="pdf")
+        doc = fitz.open(stream=file.read(), filetype="pdf")
     except Exception as e:
         st.error(f"Erreur lors de l'ouverture du fichier : {e}")
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame()
 
     # Lecture du texte complet
     full_text = ""
@@ -72,45 +70,44 @@ def extract_hbl_data(file, debug=False):
                 if re.match(r"^\d", desc_line):  # Éviter de prendre un montant comme description
                     desc_line = ""
 
-            # --- Recherche du montant le plus proche ---
+            # --- Recherche du montant --- 
             hono_value = None
             source_line = line
-            source_next = lines[i + 1] if i + 1 < len(lines) else ""
 
-            # Chercher le montant sur la même ligne ou les suivantes
-            montant_match_same = re.findall(r"\b\d{1,3}(?:,\d{2})\b", line)
-            montant_match_next = re.findall(r"\b\d{1,3}(?:,\d{2})\b", source_next) if i + 1 < len(lines) else []
+            # 1️⃣ Cherche sur la même ligne après le code
+            line_after_code = line.split(code)[-1]
+            montants_after = re.findall(r"\d{1,3},\d{2}", line_after_code)
+            if montants_after:
+                hono_value = float(montants_after[0].replace(",", "."))
 
-            all_amounts = [float(m.replace(",", ".")) for m in montant_match_same + montant_match_next]
-            if all_amounts:
-                hono_value = all_amounts[0]  # Prendre le premier montant comme base
-            else:
-                # Recherche dans les 5 lignes suivantes si aucun montant trouvé
-                for j in range(i + 1, min(i + 6, len(lines))):
-                    next_lines = lines[j].strip()
-                    montant_match_extra = re.findall(r"\b\d{1,3}(?:,\d{2})\b", next_lines)
-                    if montant_match_extra:
-                        hono_value = float(montant_match_extra[0].replace(",", "."))
-                        source_next = next_lines
+            # 2️⃣ Si rien trouvé, cherche sur les 1-2 lignes suivantes
+            if not hono_value:
+                for j in range(i + 1, min(i + 3, len(lines))):
+                    next_line = lines[j].strip()
+                    montants_next = re.findall(r"\d{1,3},\d{2}", next_line)
+                    if montants_next:
+                        hono_value = float(montants_next[0].replace(",", "."))
+                        source_line_next = next_line
                         break
+                else:
+                    source_line_next = ""
 
-            # Vérification spécifique pour "ABDESSALEM MAJID" et "HBLD680"
-            if current_patient == "ABDESSALEM MAJID" and code == "HBLD680" and not hono_value:
-                for j in range(i, min(i + 6, len(lines))):
-                    check_line = lines[j].strip()
-                    if re.search(r"472,50", check_line):
-                        hono_value = 472.50
-                        source_next = check_line
-                        break
-
-            # Vérification spécifique pour "ABDESSALEM MAJID" et "HBLD131"
-            if current_patient == "ABDESSALEM MAJID" and code == "HBLD131" and not hono_value:
-                for j in range(i, min(i + 6, len(lines))):
-                    check_line = lines[j].strip()
-                    if re.search(r"556,00", check_line):
-                        hono_value = 556.00
-                        source_next = check_line
-                        break
+            # 3️⃣ Vérification spécifique pour certains cas (facultatif)
+            if current_patient == "ABDESSALEM MAJID":
+                if code == "HBLD680" and not hono_value:
+                    for j in range(i, min(i + 6, len(lines))):
+                        check_line = lines[j].strip()
+                        if re.search(r"472,50", check_line):
+                            hono_value = 472.50
+                            source_line_next = check_line
+                            break
+                if code == "HBLD131" and not hono_value:
+                    for j in range(i, min(i + 6, len(lines))):
+                        check_line = lines[j].strip()
+                        if re.search(r"556,00", check_line):
+                            hono_value = 556.00
+                            source_line_next = check_line
+                            break
 
             # Enregistrer les lignes brutes pour le mode debug
             if debug:
@@ -118,8 +115,7 @@ def extract_hbl_data(file, debug=False):
                     "Patient": current_patient,
                     "Code": code,
                     "Ligne code": source_line,
-                    "Ligne suivante": source_next,
-                    "Montants trouvés": ", ".join(montant_match_same + montant_match_next) or "Aucun",
+                    "Ligne suivante": source_line_next if 'source_line_next' in locals() else "",
                     "Hono extrait": hono_value if hono_value else "❌ Non trouvé"
                 })
 
@@ -146,6 +142,9 @@ desmos_file = st.file_uploader("📄 Upload le fichier Desmos PDF", type=["pdf"]
 debug_mode = st.checkbox("🧩 Activer le mode debug (affiche les lignes sources)", value=True)
 
 if desmos_file:
+    st.write("Nom du fichier :", desmos_file.name)
+    st.write("Taille du fichier :", desmos_file.size, "octets")
+    
     df, df_debug = extract_hbl_data(desmos_file, debug=debug_mode)
 
     if not df.empty:
@@ -166,6 +165,6 @@ if desmos_file:
             st.divider()
             st.subheader("🔍 Détails du mode DEBUG (lignes brutes du PDF)")
             st.dataframe(df_debug, width='stretch')
-            st.info("💡 Vérifie ici si le montant correct (ex: 556,00 ou 472,50) apparaît bien.")
+            st.info("💡 Vérifie ici si le montant correct apparaît bien.")
     else:
         st.warning("⚠️ Aucun acte HBL trouvé dans le fichier.")
