@@ -5,12 +5,12 @@ import pandas as pd
 import io
 
 # Configuration Streamlit
-st.set_page_config(page_title="Récapitulatif des Patients et Tarifs", layout="wide")
-st.title("📊 Récapitulatif des Patients et Tarifs du fichier Desmos")
+st.set_page_config(page_title="Récapitulatif HBL Patients et Tarifs", layout="wide")
+st.title("🏥 Récapitulatif des Actes HBL (Couronnes, Bridges, etc.) du fichier Desmos")
 
 
-def extract_patient_totals(file):
-    """Extrait patients, actes, totaux et Cot.+Coef. depuis le PDF Desmos."""
+def extract_hbl_data(file):
+    """Extrait uniquement les actes dont le code commence par HBL, avec Cot.+Coef. et total Hono."""
     if not file:
         return pd.DataFrame()
 
@@ -30,35 +30,35 @@ def extract_patient_totals(file):
     for page in doc:
         full_text += page.get_text("text") + "\n"
 
+    # Nettoyage
     lines = [l.strip() for l in full_text.split("\n") if l.strip()]
 
-    patient_data = []
+    patients = []
     current_patient = None
-    current_actes = []
-    current_total = 0.0
-    current_coef = []
+    current_hbl_actes = []
+    current_hbl_coef = []
+    current_hbl_total = 0.0
     capture_acte = False
-    has_HBL = False  # Flag pour filtrer les patients avec code HBL
 
-    for line in lines:
+    for i, line in enumerate(lines):
         # --- Détection patient ---
         match_patient = re.match(r"([A-ZÉÈÀÙÂÊÎÔÛÇ'\- ]+) N°INSEE\s*:\s*([\d ]+)", line)
         if match_patient:
-            # Sauvegarder le précédent si valide
-            if current_patient and has_HBL:
-                patient_data.append({
+            # Sauvegarde du précédent patient
+            if current_patient and current_hbl_actes:
+                patients.append({
                     "Nom Patient": current_patient,
-                    "Actes": "; ".join(current_actes) if current_actes else "Aucun acte trouvé",
-                    "Cot.+Coef.": "; ".join(current_coef) if current_coef else "",
-                    "Total Tarif (Hono.)": round(current_total, 2)
+                    "Actes HBL": "; ".join(current_hbl_actes),
+                    "Cot.+Coef.": "; ".join(current_hbl_coef),
+                    "Total Tarif (Hono.)": round(current_hbl_total, 2)
                 })
 
+            # Initialisation pour le nouveau patient
             current_patient = match_patient.group(1).strip()
-            current_actes = []
-            current_total = 0.0
-            current_coef = []
+            current_hbl_actes = []
+            current_hbl_coef = []
+            current_hbl_total = 0.0
             capture_acte = False
-            has_HBL = False
             continue
 
         # --- Début d’un bloc d’actes ---
@@ -66,69 +66,78 @@ def extract_patient_totals(file):
             capture_acte = True
             continue
 
-        # --- Fin d’un bloc d’actes ---
+        # --- Fin d’un bloc ---
         if "Total Facture" in line or "Total des Factures et Avoirs" in line:
             capture_acte = False
             continue
 
-        # --- Lecture des lignes d’actes ---
-        if capture_acte:
-            # Si la ligne contient un code d’acte (HB...)
-            if re.match(r"^HB[A-Z0-9]+", line):
-                code = line.strip()
-                if code.startswith("HBL"):
-                    has_HBL = True  # Patient à conserver
-                current_actes.append(code)
-                continue
+        if not capture_acte:
+            continue
 
-            # Si la ligne contient une valeur Cot.+Coef.
-            coef_match = re.findall(r"\b\d+,\d{2}\b", line)
-            if coef_match:
-                # On prend la première valeur comme Cot.+Coef.
-                current_coef.append(coef_match[0].replace(",", "."))
+        # --- Recherche d’un code HBL ---
+        if re.match(r"^(HBL[A-Z0-9]+)", line):
+            code = re.match(r"^(HBL[A-Z0-9]+)", line).group(1)
+            current_hbl_actes.append(code)
 
-            # Si la ligne contient un montant Hono (souvent le dernier nombre sur la ligne)
+            # Recherche du texte précédent (description acte)
+            if i > 0:
+                desc_line = lines[i - 1].strip()
+                if len(desc_line) > 5 and not re.match(r"^\d", desc_line):
+                    current_hbl_actes[-1] += f" - {desc_line}"
+
+            # Recherche de Cot.+Coef. dans les lignes précédentes
+            j = i - 3
+            coef_value = None
+            while j < i and j >= 0:
+                coef_match = re.findall(r"\b\d+,\d{2}\b", lines[j])
+                if coef_match:
+                    coef_value = coef_match[0].replace(",", ".")
+                    break
+                j += 1
+
+            if coef_value:
+                current_hbl_coef.append(coef_value)
+
+            # Recherche du montant Hono (souvent sur la même ligne ou juste après)
             montant_match = re.findall(r"\d+,\d{2}", line)
             if montant_match:
                 try:
                     montant = float(montant_match[-1].replace(",", "."))
-                    current_total += montant
+                    current_hbl_total += montant
                 except ValueError:
                     pass
 
-    # Sauvegarder le dernier patient si HBL présent
-    if current_patient and has_HBL:
-        patient_data.append({
+    # Sauvegarde du dernier patient
+    if current_patient and current_hbl_actes:
+        patients.append({
             "Nom Patient": current_patient,
-            "Actes": "; ".join(current_actes) if current_actes else "Aucun acte trouvé",
-            "Cot.+Coef.": "; ".join(current_coef) if current_coef else "",
-            "Total Tarif (Hono.)": round(current_total, 2)
+            "Actes HBL": "; ".join(current_hbl_actes),
+            "Cot.+Coef.": "; ".join(current_hbl_coef),
+            "Total Tarif (Hono.)": round(current_hbl_total, 2)
         })
 
-    # --- Conversion en DataFrame ---
-    if patient_data:
-        df = pd.DataFrame(patient_data)
+    if patients:
+        df = pd.DataFrame(patients)
         return df
     return pd.DataFrame()
 
 
-# --- Exécution principale ---
+# --- Interface principale ---
 desmos_file = st.file_uploader("📄 Upload le fichier Desmos PDF", type=["pdf"])
 
 if desmos_file:
-    df = extract_patient_totals(desmos_file)
+    df = extract_hbl_data(desmos_file)
 
     if not df.empty:
-        st.success(f"✅ {len(df)} patients trouvés avec actes HBL")
+        st.success(f"✅ {len(df)} patients avec actes HBL trouvés")
         st.dataframe(df, use_container_width=True)
 
-        # Téléchargement CSV
         csv = df.to_csv(index=False).encode("utf-8")
         st.download_button(
             "⬇️ Télécharger le récapitulatif HBL en CSV",
             csv,
-            "recapitulatif_patients_HBL.csv",
+            "recapitulatif_HBL.csv",
             "text/csv"
         )
     else:
-        st.warning("⚠️ Aucun patient avec un acte commençant par HBL n’a été trouvé.")
+        st.warning("⚠️ Aucun acte HBL trouvé dans le fichier.")
