@@ -59,86 +59,30 @@ def extract_hbl_data(file, debug=False):
         if not capture_acte or not current_patient:
             continue
 
-        # --- Détection d’un code HBL ---
-        match_hbl = re.match(r"^(HBL[A-Z0-9]+)", line)
+        # --- Détection d’un code HBL (corrigé) ---
+        match_hbl = re.search(r"(HBL[A-Z0-9]+)", line)
         if match_hbl:
             code = match_hbl.group(1)
             if code in excluded_codes:
                 continue
-
-            desc_line = ""
-            if i > 0:
-                desc_line = lines[i - 1].strip()
-                if re.match(r"^\d", desc_line):  # Éviter de prendre un montant comme description
-                    desc_line = ""
-
-            # --- Recherche du montant le plus proche ---
-            hono_value = None
-            source_line = line
-            source_next = lines[i + 1] if i + 1 < len(lines) else ""
-
-            # Chercher le montant sur la même ligne ou les suivantes
-            montant_match_same = re.findall(r"\b\d{1,3}(?:,\d{2})\b", line)
-            montant_match_next = re.findall(r"\b\d{1,3}(?:,\d{2})\b", source_next) if i + 1 < len(lines) else []
-
-            all_amounts = [float(m.replace(",", ".")) for m in montant_match_same + montant_match_next]
-            if all_amounts:
-                hono_value = all_amounts[0]  # Prendre le premier montant comme base
-            else:
-                # Recherche dans les 5 lignes suivantes si aucun montant trouvé
-                for j in range(i + 1, min(i + 6, len(lines))):
-                    next_lines = lines[j].strip()
-                    montant_match_extra = re.findall(r"\b\d{1,3}(?:,\d{2})\b", next_lines)
-                    if montant_match_extra:
-                        hono_value = float(montant_match_extra[0].replace(",", "."))
-                        source_next = next_lines
-                        break
-
-            # Vérification spécifique pour "ABDESSALEM MAJID" et "HBLD680"
-            if current_patient == "ABDESSALEM MAJID" and code == "HBLD680" and not hono_value:
-                for j in range(i, min(i + 6, len(lines))):
-                    check_line = lines[j].strip()
-                    if re.search(r"472,50", check_line):
-                        hono_value = 472.50
-                        source_next = check_line
-                        break
-
-            # Vérification spécifique pour "ABDESSALEM MAJID" et "HBLD131"
-            if current_patient == "ABDESSALEM MAJID" and code == "HBLD131" and not hono_value:
-                for j in range(i, min(i + 6, len(lines))):
-                    check_line = lines[j].strip()
-                    if re.search(r"556,00", check_line):
-                        hono_value = 556.00
-                        source_next = check_line
-                        break
-
-            # Vérification spécifique pour "ABDESSALEM MAJID" et "HBLD090"
-            if current_patient == "ABDESSALEM MAJID" and code == "HBLD090" and not hono_value:
-                for j in range(i, min(i + 6, len(lines))):
-                    check_line = lines[j].strip()
-                    if re.search(r"130,00", check_line):
-                        hono_value = 130.00
-                        source_next = check_line
-                        break
-
-            # Enregistrer les lignes brutes pour le mode debug
-            if debug:
-                debug_info.append({
-                    "Patient": current_patient,
-                    "Code": code,
-                    "Ligne code": source_line,
-                    "Ligne suivante": source_next,
-                    "Montants trouvés": ", ".join(montant_match_same + montant_match_next) or "Aucun",
-                    "Hono extrait": hono_value if hono_value else "❌ Non trouvé"
+            # Description = tout ce qui suit le code HBL sur la ligne
+            desc = line.split(code, 1)[-1].strip()
+            # Hono = premier montant après le code HBL sur la ligne
+            hono_match = re.search(rf"{code}.*?(\d+,\d{{2}})", line)
+            hono = hono_match.group(1).replace(",", ".") if hono_match else ""
+            if not hono:
+                # Si pas de montant sur la ligne, cherche sur la suivante
+                if i + 1 < len(lines):
+                    next_line = lines[i + 1]
+                    hono_match_next = re.search(r"(\d+,\d{2})", next_line)
+                    hono = hono_match_next.group(1).replace(",", ".") if hono_match_next else ""
+            if code not in excluded_codes and hono:
+                data.append({
+                    "Nom Patient": current_patient,
+                    "Code HBL": code,
+                    "Description": desc,
+                    "Hono.": hono
                 })
-
-            # Ajouter au tableau principal
-            data.append({
-                "Nom Patient": current_patient,
-                "Code HBL": code,
-                "Description": desc_line if desc_line else "(non trouvée)",
-                "Hono.": hono_value
-            })
 
     if not data:
         return pd.DataFrame(), pd.DataFrame()
