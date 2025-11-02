@@ -4,7 +4,7 @@ import re
 import pandas as pd
 
 st.set_page_config(page_title="Récap HBL - Extraction Fiable", layout="wide")
-st.title("Récapitulatif HBL – Extraction par colonnes (PDF réel)")
+st.title("Récapitulatif HBL – Extraction par colonne Cot.+Coef.")
 
 def extract_hbl_from_pdf(file, debug=False):
     if not file:
@@ -20,9 +20,9 @@ def extract_hbl_from_pdf(file, debug=False):
     data = []
     debug_info = []
 
-    # --- 1. Trouver les positions X des colonnes sur la page 1 ---
+    # --- 1. Trouver les positions X des colonnes ---
     col_x = {}
-    for page_num in range(min(2, doc.page_count)):
+    for page_num in range(min(3, doc.page_count)):
         page = doc[page_num]
         blocks = page.get_text("dict")["blocks"]
         for block in blocks:
@@ -31,21 +31,22 @@ def extract_hbl_from_pdf(file, debug=False):
                 for span in line["spans"]:
                     text = span["text"].strip()
                     x = span["bbox"][0]
-                    if text == "Hono.":
+                    if text == "Cot.+Coef.":
+                        col_x["Cot.+Coef."] = x
+                    elif text == "Hono.":
                         col_x["Hono."] = x
                     elif text == "AMO":
                         col_x["AMO"] = x
-                    elif text == "Cot.+Coef.":
-                        col_x["Cot.+Coef."] = x
-        if "Hono." in col_x:
+        if "Cot.+Coef." in col_x and "Hono." in col_x:
             break
 
-    if "Hono." not in col_x:
-        st.error("Colonne 'Hono.' non trouvée dans le PDF.")
+    if "Cot" not in col_x or "Hono." not in col_x:
+        st.error("Colonnes 'Cot.+Coef.' ou 'Hono.' non trouvées.")
         return pd.DataFrame(), pd.DataFrame()
 
+    cot_x = col_x["Cot.+Coef."]
     hono_x = col_x["Hono."]
-    TOLERANCE = 35  # Ajusté pour ton PDF
+    TOLERANCE = 30
 
     # --- 2. Parcourir toutes les pages ---
     current_patient = None
@@ -57,7 +58,6 @@ def extract_hbl_from_pdf(file, debug=False):
         for block in blocks:
             if "lines" not in block: continue
 
-            # Reconstruire les lignes avec leurs spans
             lines = []
             for line in block["lines"]:
                 spans = [(span["text"].strip(), span["bbox"][0]) for span in line["spans"] if span["text"].strip()]
@@ -81,14 +81,16 @@ def extract_hbl_from_pdf(file, debug=False):
                     i += 1
                     continue
 
-                # --- Code HBL ---
+                # --- Chercher le code HBL dans la colonne Cot.+Coef. ---
                 hbl_match = None
-                hbl_text = None
+                hbl_x_pos = None
                 for text, x in line_spans:
-                    if re.match(r"^HBL[A-Z0-9]+$", text):
-                        hbl_match = text
-                        hbl_text = text
-                        break
+                    if abs(x - cot_x) <= TOLERANCE:
+                        m = re.match(r"HBL[A-Z0-9]+", text)
+                        if m:
+                            hbl_match = m.group(0)
+                            hbl_x_pos = x
+                            break
 
                 if not hbl_match:
                     i += 1
@@ -98,9 +100,8 @@ def extract_hbl_from_pdf(file, debug=False):
                     i += 1
                     continue
 
-                # --- Chercher Hono. dans la même ligne ---
+                # --- Extraire Hono. dans la colonne Hono. ---
                 hono_value = None
-                hono_source = "même ligne"
                 for text, x in line_spans:
                     if abs(x - hono_x) <= TOLERANCE:
                         m = re.search(r"\d{1,4}(?:,\d{2})", text)
@@ -120,19 +121,14 @@ def extract_hbl_from_pdf(file, debug=False):
                                 val = float(m.group().replace(",", "."))
                                 if val > 0:
                                     hono_value = val
-                                    hono_source = "ligne suivante"
                                     break
 
-                # --- Description ---
+                # --- Description (colonne Acte) ---
                 desc = []
-                j = i + 1
-                while j < len(lines):
-                    next_text = " ".join([s[0] for s in lines[j]])
-                    if re.match(r"^\d{2}/\d{2}/\d{4}|^Total|^\d{7}$|^HBL", next_text):
-                        break
-                    if next_text.strip():
-                        desc.append(next_text.strip())
-                    j += 1
+                for text, x in line_spans:
+                    if x < cot_x - 50:  # À gauche de Cot.+Coef.
+                        if not re.match(r"^\d{1,2}$|^\d{2}/\d{2}/\d{4}$|^FSE|^[0-9]{7}$", text):
+                            desc.append(text)
                 description = " ".join(desc).strip() or "(non trouvée)"
 
                 # --- Debug ---
@@ -141,8 +137,6 @@ def extract_hbl_from_pdf(file, debug=False):
                         "Patient": current_patient,
                         "Code": hbl_match,
                         "Hono.": hono_value,
-                        "Source": hono_source,
-                        "Ligne": line_text[:100],
                         "Description": description[:100]
                     })
 
@@ -154,9 +148,8 @@ def extract_hbl_from_pdf(file, debug=False):
                         "Hono.": hono_value
                     })
 
-                i = j
+                i += 1  # Passer à la ligne suivante
 
-    # --- DataFrames ---
     df = pd.DataFrame(data)
     if not df.empty:
         df = df.sort_values(by=["Nom Patient", "Code HBL"]).reset_index(drop=True)
@@ -167,7 +160,7 @@ def extract_hbl_from_pdf(file, debug=False):
 
 # --- Interface Streamlit ---
 uploaded_file = st.file_uploader("Upload le PDF Desmos", type=["pdf"])
-debug_mode = st.checkbox("Mode debug (détails)", value=True)
+debug_mode = st.checkbox("Mode debug", value=True)
 
 if uploaded_file:
     df, df_debug = extract_hbl_from_pdf(uploaded_file, debug=debug_mode)
@@ -177,17 +170,11 @@ if uploaded_file:
         st.dataframe(df, use_container_width=True)
 
         csv = df.to_csv(index=False, encoding="utf-8-sig")
-        st.download_button(
-            "Télécharger CSV",
-            csv,
-            "recapitulatif_HBL.csv",
-            "text/csv"
-        )
+        st.download_button("Télécharger CSV", csv, "recapitulatif_HBL.csv", "text/csv")
 
         if debug_mode and not df_debug.empty:
             st.divider()
-            st.subheader("Debug : Source du Hono.")
+            st.subheader("Debug")
             st.dataframe(df_debug, use_container_width=True)
-            st.info("Vérifie que **Hono. > 0** et **Source = même ligne ou ligne suivante**")
     else:
-        st.warning("Aucun acte HBL trouvé. Vérifie le PDF.")
+        st.warning("Aucun acte HBL trouvé.")
