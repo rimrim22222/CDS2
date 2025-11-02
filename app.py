@@ -5,25 +5,26 @@ import pandas as pd
 
 # Configuration Streamlit
 st.set_page_config(page_title="Récapitulatif HBL Patients et Tarifs", layout="wide")
-st.title("Récapitulatif détaillé des actes HBL (mode DEBUG)")
+st.title("🏥 Récapitulatif détaillé des actes HBL (mode DEBUG)")
 
 def extract_hbl_data(file, debug=False):
-    """Extrait les actes HBL (une ligne par acte) – Hono. est pris juste avant le code."""
+    """Extrait les actes HBL (une ligne par acte) et montre les lignes sources si debug=True."""
     if not file:
-        return pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame()
 
     file_content = file.read()
     if not file_content or len(file_content) == 0:
         st.error("Le fichier uploadé est vide ou corrompu.")
-        return pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame()
 
     file.seek(0)
     try:
         doc = fitz.open(stream=file_content, filetype="pdf")
     except Exception as e:
         st.error(f"Erreur lors de l'ouverture du fichier : {e}")
-        return pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame()
 
+    # Lecture du texte complet
     full_text = ""
     for page in doc:
         full_text += page.get_text("text") + "\n"
@@ -59,58 +60,54 @@ def extract_hbl_data(file, debug=False):
             continue
 
         # --- Détection d’un code HBL ---
-        match_hbl = re.search(r"(HBL[A-Z0-9]+)", line)
-        if not match_hbl:
-            continue
+        match_hbl = re.match(r"^(HBL[A-Z0-9]+)", line)
+        if match_hbl:
+            code = match_hbl.group(1)
+            if code in excluded_codes:
+                continue
 
-        code = match_hbl.group(1)
-        if code in excluded_codes:
-            continue
+            # --- Collecter la description (lignes suivantes) ---
+            desc_lines = []
+            j = i + 1
+            while j < len(lines) and not re.match(r"^\d{1,2}$|^\d{2}/\d{2}/\d{4}$|^\d{1,3}(?:,\d{2})$|^Total|^FSE|^[0-9]{7}$|^\(FSE|HBL[A-Z0-9]+", lines[j]):
+                desc_lines.append(lines[j].strip())
+                j += 1
+            description = " ".join(desc_lines).strip() or "(non trouvée)"
 
-        # --- Recherche du montant Hono. juste avant le code (même ligne ou ligne précédente) ---
-        hono_value = None
-        hono_source = ""
+            # --- Rechercher le montant Hono (lignes précédentes) ---
+            hono_value = None
+            prev_lines = []  # Pour debug
 
-        # 1. Même ligne, avant le code
-        before_code = line[:match_hbl.start()].strip()
-        hono_match = re.findall(r"\b\d{1,4}(?:,\d{2})\b", before_code)
-        if hono_match:
-            hono_value = float(hono_match[-1].replace(",", "."))  # dernier montant = Hono.
-            hono_source = line
-        else:
-            # 2. Ligne précédente (souvent le cas quand le code est en début de ligne)
-            if i > 0:
-                prev_line = lines[i - 1].strip()
-                hono_match_prev = re.findall(r"\b\d{1,4}(?:,\d{2})\b", prev_line)
-                if hono_match_prev:
-                    hono_value = float(hono_match_prev[-1].replace(",", "."))
-                    hono_source = prev_line
+            # Commencer à partir de la ligne précédente
+            k = i - 1
+            skip = 0
+            if k >= 0 and re.match(r"^\d+$", lines[k]):  # N° FSE
+                k -= 1  # Skip Type (FSE Séc.)
+                skip = 2
 
-        # --- Description : lignes suivantes jusqu’à un montant ou un autre code ---
-        desc_lines = []
-        j = i + 1
-        while j < len(lines):
-            nxt = lines[j].strip()
-            if re.match(r"^\d{1,3}(?:,\d{2})$|^HBL|^[0-9]{7}$|^Total|^FSE", nxt):
-                break
-            if nxt:
-                desc_lines.append(nxt)
-            j += 1
-        description = " ".join(desc_lines).strip() or "(description manquante)"
+            # Maintenant, k pointe sur PP (dernière amount)
+            # Remonter 6 lignes pour Hono (PP, AES, Cot, AMC, AMC2, AMO, Hono)
+            hono_index = k - 6
+            if hono_index >= 0:
+                hono_line = lines[hono_index]
+                montant_match = re.search(r"^\d{1,3}(?:,\d{2})$", hono_line)
+                if montant_match:
+                    hono_value = float(montant_match.group().replace(",", "."))
 
-        # --- Debug ---
-        if debug:
-            debug_info.append({
-                "Patient": current_patient,
-                "Code": code,
-                "Ligne code": line,
-                "Source Hono.": hono_source,
-                "Hono. trouvé": hono_value,
-                "Description": description
-            })
+            # Collecter les lignes précédentes pour debug (les 10 dernières avant le code)
+            start_debug = max(0, i - 10)
+            prev_lines = lines[start_debug:i]
 
-        # --- Ajout ---
-        if hono_value is not None:
+            if debug:
+                debug_info.append({
+                    "Patient": current_patient,
+                    "Code": code,
+                    "Lignes précédentes": "\n".join(prev_lines),
+                    "Hono extrait": hono_value if hono_value else "❌ Non trouvé",
+                    "Description extraite": description
+                })
+
+            # Ajouter au tableau principal
             data.append({
                 "Nom Patient": current_patient,
                 "Code HBL": code,
@@ -118,42 +115,41 @@ def extract_hbl_data(file, debug=False):
                 "Hono.": hono_value
             })
 
-    # --- DataFrames ---
     if not data:
         return pd.DataFrame(), pd.DataFrame()
 
     df = pd.DataFrame(data)
+    df = df[df["Hono."].notnull()]  # Filtrer les lignes sans montant
     df = df.sort_values(by=["Nom Patient", "Code HBL"]).reset_index(drop=True)
 
     df_debug = pd.DataFrame(debug_info) if debug else pd.DataFrame()
     return df, df_debug
 
-
-# ==================== INTERFACE STREAMLIT ====================
-desmos_file = st.file_uploader("Upload le fichier Desmos PDF", type=["pdf"])
-debug_mode = st.checkbox("Activer le mode debug (affiche les lignes sources)", value=True)
+# --- Interface Streamlit ---
+desmos_file = st.file_uploader("📄 Upload le fichier Desmos PDF", type=["pdf"])
+debug_mode = st.checkbox("🧩 Activer le mode debug (affiche les lignes sources)", value=True)
 
 if desmos_file:
     df, df_debug = extract_hbl_data(desmos_file, debug=debug_mode)
 
     if not df.empty:
-        st.success(f"{len(df)} actes HBL trouvés pour {df['Nom Patient'].nunique()} patients")
-        st.dataframe(df, use_container_width=True)
+        st.success(f"✅ {len(df)} actes HBL trouvés pour {df['Nom Patient'].nunique()} patients")
+        st.dataframe(df)
 
-        # Téléchargement CSV
-        csv = df.to_csv(index=False, encoding="utf-8-sig")
+        # Téléchargement du CSV principal
+        csv = df.to_csv(index=False).encode("utf-8")
         st.download_button(
-            "Télécharger le récapitulatif HBL en CSV",
+            "⬇️ Télécharger le récapitulatif HBL en CSV",
             csv,
             "recapitulatif_HBL.csv",
             "text/csv"
         )
 
-        # Debug
+        # Mode debug
         if debug_mode and not df_debug.empty:
             st.divider()
-            st.subheader("Détails du mode DEBUG")
-            st.dataframe(df_debug, use_container_width=True)
-            st.info("Vérifiez que **Hono.** (et non AMO) est bien extrait.")
+            st.subheader("🔍 Détails du mode DEBUG (lignes brutes du PDF)")
+            st.dataframe(df_debug)
+            st.info("💡 Vérifie ici si le montant et la description sont correctement extraits.")
     else:
-        st.warning("Aucun acte HBL trouvé.")
+        st.warning("⚠️ Aucun acte HBL trouvé dans le fichier.")
