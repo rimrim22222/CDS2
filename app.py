@@ -1,86 +1,155 @@
 import streamlit as st
-import pdfplumber
-import pandas as pd
+import fitz  # PyMuPDF
 import re
+import pandas as pd
 
-st.set_page_config(page_title="Extraction PDF Factures", layout="wide")
+# Configuration Streamlit
+st.set_page_config(page_title="Récapitulatif HBL Patients et Tarifs", layout="wide")
+st.title("🏥 Récapitulatif détaillé des actes HBL (mode DEBUG)")
 
-st.title("📄 Extraction de données de facturation à partir d’un PDF")
+def extract_hbl_data(file, debug=False):
+    """Extrait les actes HBL (une ligne par acte) et montre les lignes sources si debug=True."""
+    if not file:
+        return pd.DataFrame()
 
-uploaded_file = st.file_uploader("📂 Choisis un fichier PDF", type=["pdf"])
+    file_content = file.read()
+    if not file_content or len(file_content) == 0:
+        st.error("Le fichier uploadé est vide ou corrompu.")
+        return pd.DataFrame()
 
-# Fonctions utilitaires
-def norm_num(s):
-    return s.replace("\u00A0", "").replace(" ", "").replace(",", ".") if isinstance(s, str) else s
+    file.seek(0)
+    try:
+        doc = fitz.open(stream=file_content, filetype="pdf")
+    except Exception as e:
+        st.error(f"Erreur lors de l'ouverture du fichier : {e}")
+        return pd.DataFrame()
 
-def extract_data_from_pdf(pdf_file):
-    rows = []
-    with pdfplumber.open(pdf_file) as pdf:
-        full_text = ""
-        for page in pdf.pages:
-            text = page.extract_text() or ""
-            full_text += "\n" + text.replace("\xa0", " ")
+    # Lecture du texte complet
+    full_text = ""
+    for page in doc:
+        full_text += page.get_text("text") + "\n"
 
-    header_re = re.compile(r"([A-ZÉÈÊËÎÏÔÖÙÛÜÇ' \-]{3,})\s+N° Dossier", re.MULTILINE)
-    code_re = re.compile(r"(H[A-Z]{2,4}\d{3})")
-    num_re = re.compile(r"-?\d{1,3}(?:[ \u00A0]\d{3})*(?:,\d{2})")
+    lines = [l.strip() for l in full_text.split("\n") if l.strip()]
 
-    headers = [(m.start(), m.group(1).strip()) for m in header_re.finditer(full_text)]
-    headers.sort()
+    excluded_codes = {"HBLD073", "HBLD490", "HBLD724"}
+    data = []
+    debug_info = []
 
-    for m in code_re.finditer(full_text):
-        code = m.group(1)
-        pos = m.start()
-        name = ""
-        for hp, hn in reversed(headers):
-            if hp < pos:
-                name = hn
-                break
+    current_patient = None
+    capture_acte = False
 
-        before = full_text[max(0, pos - 220):pos]
-        after = full_text[pos: pos + 120]
-        nums_before = num_re.findall(before)
-        nums_after = num_re.findall(after)
-        nums = [n.replace("\u00A0", " ").strip() for n in nums_before[-8:]] + [n.replace("\u00A0", " ").strip() for n in nums_after[:4]]
+    for i, line in enumerate(lines):
+        # --- Détection du patient ---
+        match_patient = re.match(r"([A-ZÉÈÀÙÂÊÎÔÛÇ'\- ]+) N° Dossier : \d+ N°INSEE : ([\d ]*)", line)
+        if match_patient:
+            current_patient = match_patient.group(1).strip()
+            capture_acte = False
+            continue
 
-        hono, cotcoef = "", ""
-        if len(nums) >= 6:
-            run = nums[-6:]
-            hono, cotcoef = run[0], run[3]
-        elif len(nums) >= 4:
-            run = nums[-4:]
-            hono, cotcoef = run[0], run[3]
-        elif len(nums) == 3:
-            hono, cotcoef = nums[0], nums[2]
-        elif len(nums) == 2:
-            hono, cotcoef = nums[0], nums[1]
-        elif len(nums) == 1:
-            hono = nums[0]
+        # --- Début bloc actes ---
+        if re.match(r"^\d{2}/\d{2}/\d{4}", line):
+            capture_acte = True
+            continue
 
-        desc_match = re.search(re.escape(code) + r"([^\n\r]{0,120})", full_text[pos: pos + 200])
-        acte_desc = code + (desc_match.group(1).strip() if desc_match else "")
+        # --- Fin bloc actes ---
+        if "Total Facture" in line or "Total des Factures et Avoirs" in line:
+            capture_acte = False
+            continue
 
-        rows.append([name, acte_desc, cotcoef, hono])
+        if not capture_acte or not current_patient:
+            continue
 
-    df = pd.DataFrame(rows, columns=["Nom", "Acte", "Cot.+Coef.", "Hono."])
-    df["Cot.+Coef."] = df["Cot.+Coef."].apply(norm_num)
-    df["Hono."] = df["Hono."].apply(norm_num)
-    df.drop_duplicates(inplace=True)
-    return df
+        # --- Détection d’un code HBL ---
+        match_hbl = re.match(r"^(HBL[A-Z0-9]+)", line)
+        if match_hbl:
+            code = match_hbl.group(1)
+            if code in excluded_codes:
+                continue
 
-# Interface Streamlit
-if uploaded_file:
-    with st.spinner("🔍 Extraction des données en cours..."):
-        df = extract_data_from_pdf(uploaded_file)
+            # --- Collecter la description (lignes suivantes) ---
+            desc_lines = []
+            j = i + 1
+            while j < len(lines) and not re.match(r"^\d{1,2}$|^\d{2}/\d{2}/\d{4}$|^\d{1,3}(?:,\d{2})$|^Total|^FSE|^[0-9]{7}$|^\(FSE|HBL[A-Z0-9]+", lines[j]):
+                desc_lines.append(lines[j].strip())
+                j += 1
+            description = " ".join(desc_lines).strip() or "(non trouvée)"
 
-    st.success(f"✅ Extraction terminée : {len(df)} lignes trouvées")
+            # --- Rechercher le montant Hono (lignes précédentes) ---
+            hono_value = None
+            prev_lines = []  # Pour debug
 
-    # Afficher le tableau
-    st.dataframe(df, use_container_width=True)
+            # Commencer à partir de la ligne précédente
+            k = i - 1
+            skip = 0
+            if k >= 0 and re.match(r"^\d+$", lines[k]):  # N° FSE
+                k -= 1  # Skip Type (FSE Séc.)
+                skip = 2
 
-    # Téléchargement CSV
-    csv = df.to_csv(index=False).encode("utf-8")
-    st.download_button("💾 Télécharger en CSV", csv, "extraction_factures.csv", "text/csv")
+            # Maintenant, k pointe sur PP (dernière amount)
+            # Remonter 6 lignes pour Hono (PP, AES, Cot, AMC, AMC2, AMO, Hono)
+            hono_index = k - 6
+            if hono_index >= 0:
+                hono_line = lines[hono_index]
+                montant_match = re.search(r"^\d{1,3}(?:,\d{2})$", hono_line)
+                if montant_match:
+                    hono_value = float(montant_match.group().replace(",", "."))
 
-else:
-    st.info("➡️ Téléverse un fichier PDF pour commencer l’analyse.")
+            # Collecter les lignes précédentes pour debug (les 10 dernières avant le code)
+            start_debug = max(0, i - 10)
+            prev_lines = lines[start_debug:i]
+
+            if debug:
+                debug_info.append({
+                    "Patient": current_patient,
+                    "Code": code,
+                    "Lignes précédentes": "\n".join(prev_lines),
+                    "Hono extrait": hono_value if hono_value else "❌ Non trouvé",
+                    "Description extraite": description
+                })
+
+            # Ajouter au tableau principal
+            data.append({
+                "Nom Patient": current_patient,
+                "Code HBL": code,
+                "Description": description,
+                "Hono.": hono_value
+            })
+
+    if not data:
+        return pd.DataFrame(), pd.DataFrame()
+
+    df = pd.DataFrame(data)
+    df = df[df["Hono."].notnull()]  # Filtrer les lignes sans montant
+    df = df.sort_values(by=["Nom Patient", "Code HBL"]).reset_index(drop=True)
+
+    df_debug = pd.DataFrame(debug_info) if debug else pd.DataFrame()
+    return df, df_debug
+
+# --- Interface Streamlit ---
+desmos_file = st.file_uploader("📄 Upload le fichier Desmos PDF", type=["pdf"])
+debug_mode = st.checkbox("🧩 Activer le mode debug (affiche les lignes sources)", value=True)
+
+if desmos_file:
+    df, df_debug = extract_hbl_data(desmos_file, debug=debug_mode)
+
+    if not df.empty:
+        st.success(f"✅ {len(df)} actes HBL trouvés pour {df['Nom Patient'].nunique()} patients")
+        st.dataframe(df)
+
+        # Téléchargement du CSV principal
+        csv = df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "⬇️ Télécharger le récapitulatif HBL en CSV",
+            csv,
+            "recapitulatif_HBL.csv",
+            "text/csv"
+        )
+
+        # Mode debug
+        if debug_mode and not df_debug.empty:
+            st.divider()
+            st.subheader("🔍 Détails du mode DEBUG (lignes brutes du PDF)")
+            st.dataframe(df_debug)
+            st.info("💡 Vérifie ici si le montant et la description sont correctement extraits.")
+    else:
+        st.warning("⚠️ Aucun acte HBL trouvé dans le fichier.")
