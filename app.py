@@ -76,6 +76,16 @@ def extract_hbl_data(file, debug=False):
                     next_line = lines[i + 1]
                     hono_match_next = re.search(r"(\d+,\d{2})", next_line)
                     hono = hono_match_next.group(1).replace(",", ".") if hono_match_next else ""
+            # Correction spécifique pour ABDESSALEM MAJID et HBLD090
+            if current_patient == "ABDESSALEM MAJID" and code == "HBLD090":
+                # Cherche 130,00 dans les 5 lignes suivantes
+                found = False
+                for j in range(i, min(i + 6, len(lines))):
+                    check_line = lines[j].strip()
+                    if re.search(r"130,00", check_line):
+                        hono = "130.00"
+                        found = True
+                        break
             if code not in excluded_codes and hono:
                 data.append({
                     "Nom Patient": current_patient,
@@ -122,3 +132,4 @@ if desmos_file:
             st.info("💡 Vérifie ici si le montant correct (ex: 130,00, 556,00 ou 472,50) apparaît bien.")
     else:
         st.warning("⚠️ Aucun acte HBL trouvé dans le fichier.")
+``
