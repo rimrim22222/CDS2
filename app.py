@@ -15,35 +15,15 @@ def extract_text_from_image(image):
     return pytesseract.image_to_string(image)
 
 def extract_data_from_cosmident(file):
-    """Extraction Cosmident : garde tous les prix mais ignore les descriptions en petite police (<8.5)."""
     if file.type == "application/pdf":
         doc = fitz.open(stream=file.read(), filetype="pdf")
         full_text = ""
-        all_lines = []
-
-        # On extrait tout, mais on note la taille de police de chaque span
         for page in doc:
-            page_dict = page.get_text("dict")
-            for block in page_dict["blocks"]:
-                for line in block.get("lines", []):
-                    line_text = ""
-                    max_size = 0
-                    for span in line.get("spans", []):
-                        line_text += span["text"]
-                        if span["size"] > max_size:
-                            max_size = span["size"]
-                    if line_text.strip():
-                        all_lines.append((line_text.strip(), max_size))
-        # On garde toutes les lignes (pour ne pas perdre les prix),
-        # mais on utilisera la taille pour ignorer les petites lignes descriptives
-        lines = [l for l, _ in all_lines]
-        line_sizes = dict(all_lines)
+            full_text += page.get_text() + "\n"
     else:
         image = Image.open(file)
         full_text = extract_text_from_image(image)
-        lines = full_text.split('\n')
-        line_sizes = {l: 10 for l in lines}  # Valeur arbitraire pour l’OCR
-
+    lines = full_text.split('\n')
     results = []
     current_patient = None
     i = 0
@@ -52,40 +32,65 @@ def extract_data_from_cosmident(file):
         i += 1
         if not line:
             continue
-
-        # Détection du patient
         ref_match = re.search(r'Ref\. ([\w\s\-]+)', line)
+        if not ref_match:
+            bon_match = re.match(r'Bon n°\d+ du [\w\d/]+.*Prescription \d+', line)
+            if bon_match and i < len(lines):
+                next_line = lines[i].strip()
+                ref_match = re.search(r'Ref\. ([\w\s\-]+)', next_line)
+                if ref_match:
+                    current_patient = ref_match.group(1).strip()
+                    i += 1
+                    continue
         if ref_match:
             current_patient = ref_match.group(1).strip()
             continue
         if current_patient is None:
             continue
-
-        # On ignore les lignes en petit texte (<8.5)
-        if line_sizes.get(line, 10) < 8.5:
-            continue
-
         description = line
-        # Si la ligne semble être un acte dentaire
-        if re.search(r'(ZIRCONE|EMAX|ONLAY|GOUTTIÈRE|PLAQUE|MONTAGE|ADJONCTION|DENT RESINE|HBL|COURONNE)', description, re.IGNORECASE):
-            # On cherche les prix dans les lignes suivantes
-            price = ""
-            while i < len(lines):
-                next_line = lines[i].strip()
-                i += 1
-                if not next_line:
-                    continue
-                # Cherche une valeur numérique de type 00.00
-                price_match = re.search(r'(\d+\.\d{2})', next_line)
-                if price_match:
-                    price = price_match.group(1)
+        while i < len(lines):
+            next_line = lines[i].strip()
+            i += 1
+            if not next_line:
+                continue
+            if re.match(r'^\d+\.\d{2}$', next_line):
+                quantity = next_line
+                price = ""
+                while i < len(lines):
+                    price_line = lines[i].strip()
+                    i += 1
+                    if price_line and re.match(r'^\d+\.\d{2}$', price_line):
+                        price = price_line
+                        break
+                remise = ""
+                while i < len(lines):
+                    remise_line = lines[i].strip()
+                    i += 1
+                    remise = remise_line if remise_line else "0.00"
                     break
-            if price:
-                results.append({
-                    'Patient': current_patient,
-                    'Acte Cosmident': description,
-                    'Prix Cosmident': price
-                })
+                total = ""
+                while i < len(lines):
+                    total_line = lines[i].strip()
+                    i += 1
+                    if total_line and re.match(r'^\d+\.\d{2}$', total_line):
+                        total = total_line
+                        break
+                dents_match = re.findall(r'\b\d{2}\b', description)
+                dents = ", ".join(dents_match) if dents_match else ""
+                try:
+                    price_float = float(price)
+                    total_float = float(total)
+                    if price_float > 0 and total_float > 0:
+                        results.append({
+                            'Patient': current_patient,
+                            'Acte Cosmident': description,
+                            'Prix Cosmident': price
+                        })
+                except ValueError:
+                    pass
+                break
+            else:
+                description += " " + next_line
     return pd.DataFrame(results)
 
 def extract_desmos_acts(file):
@@ -101,20 +106,25 @@ def extract_desmos_acts(file):
     for idx, line in enumerate(lines):
         patient_match = re.search(r'Ref\. ([A-ZÉÈÇÂÊÎÔÛÄËÏÖÜÀÙa-zéèçâêîôûäëïöüàù\s\-]+)', line)
         if patient_match:
+            # Nouveau patient, sauvegarde l'acte précédent si besoin
             if current_patient and current_acte and current_hono:
                 data.append({'Patient': current_patient, 'Acte Desmos': current_acte.strip(), 'Prix Desmos': current_hono})
             current_patient = patient_match.group(1).strip()
             current_acte = ""
             current_hono = ""
+        # Si la ligne contient un intitulé d'acte (ex : BIOTECH Pilier, Couronne transvissée, ZIRCONE, etc.)
         elif re.search(r'(BIOTECH|Couronne transvissée|HBL\w+|ZIRCONE|GOUTTIÈRE SOUPLE|EMAX|ONLAY|PLAQUE|ADJONCTION|MONTAGE|DENT RESINE)', line, re.IGNORECASE):
             current_acte = line.strip()
             current_hono = ""
+        # Si la ligne contient Hono., on récupère le prix
         elif "Hono" in line:
             hono_match = re.search(r'Hono\.?\s*:?\s*([\d,\.]+)', line)
             if hono_match:
                 current_hono = hono_match.group(1).replace(',', '.')
+        # Si la ligne suivante n'est pas un patient et contient un prix, on l'ajoute aussi
         elif current_acte and re.match(r'^\d+[\.,]\d{2}$', line):
             current_hono = line.replace(',', '.')
+    # Ajoute le dernier acte si besoin
     if current_patient and current_acte and current_hono:
         data.append({'Patient': current_patient, 'Acte Desmos': current_acte.strip(), 'Prix Desmos': current_hono})
     return pd.DataFrame(data)
@@ -142,4 +152,4 @@ if uploaded_cosmident and uploaded_desmos:
     st.success("✅ Extraction et fusion terminées")
     st.dataframe(df_cosmident, use_container_width=True)
 else:
-    st.info("Veuillez charger les deux fichiers PDF (Cosmident et Desmos) pour lancer l'analyse.")
+    st.info("Veuillez charger les deux fichiers PDF (Cosmident et Desmos) pour lancer l'analyse.") 
