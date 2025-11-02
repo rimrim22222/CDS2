@@ -4,7 +4,7 @@ import re
 import pandas as pd
 
 st.set_page_config(page_title="Récap HBL - Extraction Fiable", layout="wide")
-st.title("Récapitulatif HBL – Extraction précise par position")
+st.title("Récapitulatif HBL – Extraction par colonnes (PDF réel)")
 
 def extract_hbl_from_pdf(file, debug=False):
     if not file:
@@ -20,7 +20,7 @@ def extract_hbl_from_pdf(file, debug=False):
     data = []
     debug_info = []
 
-    # --- 1. Trouver les positions X des colonnes (page 1) ---
+    # --- 1. Trouver les positions X des colonnes sur la page 1 ---
     col_x = {}
     for page_num in range(min(2, doc.page_count)):
         page = doc[page_num]
@@ -45,12 +45,10 @@ def extract_hbl_from_pdf(file, debug=False):
         return pd.DataFrame(), pd.DataFrame()
 
     hono_x = col_x["Hono."]
-    TOLERANCE = 25  # Ajusté pour ton PDF
+    TOLERANCE = 35  # Ajusté pour ton PDF
 
     # --- 2. Parcourir toutes les pages ---
     current_patient = None
-    current_date = None
-    current_facture = None
 
     for page_num in range(doc.page_count):
         page = doc[page_num]
@@ -59,13 +57,10 @@ def extract_hbl_from_pdf(file, debug=False):
         for block in blocks:
             if "lines" not in block: continue
 
+            # Reconstruire les lignes avec leurs spans
             lines = []
             for line in block["lines"]:
-                spans = []
-                for span in line["spans"]:
-                    text = span["text"].strip()
-                    if text:
-                        spans.append((text, span["bbox"][0]))
+                spans = [(span["text"].strip(), span["bbox"][0]) for span in line["spans"] if span["text"].strip()]
                 if spans:
                     lines.append(spans)
 
@@ -75,16 +70,9 @@ def extract_hbl_from_pdf(file, debug=False):
                 line_text = " ".join([s[0] for s in line_spans])
 
                 # --- Patient ---
-                match_patient = re.search(r"([A-ZÉÈÀÙÂÊÎÔÛÇ'\- ]+) N° Dossier", line_text)
+                match_patient = re.search(r"([A-ZÉÈÀÙÂÊÎÔÛÇ'\- ]+) N° Dossier : \d+", line_text)
                 if match_patient:
                     current_patient = match_patient.group(1).strip()
-                    i += 1
-                    continue
-
-                # --- Date + N° Facture ---
-                date_match = re.match(r"(\d{2}/\d{2}/\d{4})\s+\d+", line_text)
-                if date_match:
-                    current_date = date_match.group(1)
                     i += 1
                     continue
 
@@ -95,12 +83,11 @@ def extract_hbl_from_pdf(file, debug=False):
 
                 # --- Code HBL ---
                 hbl_match = None
-                hbl_x = None
+                hbl_text = None
                 for text, x in line_spans:
-                    m = re.match(r"HBL[A-Z0-9]+", text)
-                    if m:
-                        hbl_match = m.group(0)
-                        hbl_x = x
+                    if re.match(r"^HBL[A-Z0-9]+$", text):
+                        hbl_match = text
+                        hbl_text = text
                         break
 
                 if not hbl_match:
@@ -162,7 +149,6 @@ def extract_hbl_from_pdf(file, debug=False):
                 if hono_value is not None and hono_value > 0:
                     data.append({
                         "Nom Patient": current_patient,
-                        "Date": current_date,
                         "Code HBL": hbl_match,
                         "Description": description,
                         "Hono.": hono_value
@@ -173,7 +159,7 @@ def extract_hbl_from_pdf(file, debug=False):
     # --- DataFrames ---
     df = pd.DataFrame(data)
     if not df.empty:
-        df = df.sort_values(by=["Nom Patient", "Date", "Code HBL"]).reset_index(drop=True)
+        df = df.sort_values(by=["Nom Patient", "Code HBL"]).reset_index(drop=True)
 
     df_debug = pd.DataFrame(debug_info) if debug else pd.DataFrame()
     return df, df_debug
