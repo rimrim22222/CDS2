@@ -132,4 +132,3 @@ if desmos_file:
             st.info("💡 Vérifie ici si le montant correct (ex: 130,00, 556,00 ou 472,50) apparaît bien.")
     else:
         st.warning("⚠️ Aucun acte HBL trouvé dans le fichier.")
-``
