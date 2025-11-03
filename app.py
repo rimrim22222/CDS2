@@ -1,42 +1,49 @@
-import streamlit as st
-import fitz  # PyMuPDF
-import re
-import pandas as pd
-from PIL import Image
-import pytesseract
-
-st.set_page_config(page_title="Analyse Cosmident + Desmos", layout="wide")
-st.title("📄 Analyse des actes dentaires Cosmident + Desmos")
-
-uploaded_cosmident = st.file_uploader("Upload le fichier Cosmident (PDF ou image)", type=["pdf", "png", "jpg", "jpeg"])
-uploaded_desmos = st.file_uploader("Upload le fichier Desmos (PDF)", type=["pdf"], key="desmos")
-
-def extract_text_from_image(image):
-    return pytesseract.image_to_string(image)
-
 def extract_data_from_cosmident(file):
     if file.type == "application/pdf":
         doc = fitz.open(stream=file.read(), filetype="pdf")
         full_text = ""
         for page in doc:
-            full_text += page.get_text() + "\n"
+            # Texte brut de chaque page
+            page_text = page.get_text("text")
+
+            # Supprime tout ce qui se trouve après certaines mentions typiques du bas de page
+            page_text = re.split(
+                r'(COSMIDENT|IBAN|Siret|BIC|Tél\.|NOS COORDONNÉES BANCAIRES|Total \(Euros\)|TOTAL TTC|Règlement|Chèque|Par chèque)',
+                page_text,
+                flags=re.IGNORECASE
+            )[0]
+
+            full_text += page_text + "\n"
     else:
         image = Image.open(file)
         full_text = extract_text_from_image(image)
+
+    # Nettoyage général du texte
     lines = full_text.split('\n')
+    clean_lines = []
+    for line in lines:
+        line = line.strip()
+        # Ignore les lignes inutiles ou décoratives
+        if not line:
+            continue
+        if re.search(r'(teinte|couleur|A1|A2|A3|B1|B2|C1|C2|D2|ZIRCONE\s*A\d?)', line, re.IGNORECASE):
+            continue
+        if re.search(r'(COSMIDENT|IBAN|Siret|BIC|Tél\.|€|Total \(Euros\)|TOTAL TTC)', line, re.IGNORECASE):
+            continue
+        clean_lines.append(line)
+
     results = []
     current_patient = None
     i = 0
-    while i < len(lines):
-        line = lines[i].strip()
+    while i < len(clean_lines):
+        line = clean_lines[i]
         i += 1
-        if not line:
-            continue
+
         ref_match = re.search(r'Ref\. ([\w\s\-]+)', line)
         if not ref_match:
             bon_match = re.match(r'Bon n°\d+ du [\w\d/]+.*Prescription \d+', line)
-            if bon_match and i < len(lines):
-                next_line = lines[i].strip()
+            if bon_match and i < len(clean_lines):
+                next_line = clean_lines[i].strip()
                 ref_match = re.search(r'Ref\. ([\w\s\-]+)', next_line)
                 if ref_match:
                     current_patient = ref_match.group(1).strip()
@@ -47,30 +54,31 @@ def extract_data_from_cosmident(file):
             continue
         if current_patient is None:
             continue
+
         description = line
-        while i < len(lines):
-            next_line = lines[i].strip()
+        while i < len(clean_lines):
+            next_line = clean_lines[i].strip()
             i += 1
             if not next_line:
                 continue
             if re.match(r'^\d+\.\d{2}$', next_line):
                 quantity = next_line
                 price = ""
-                while i < len(lines):
-                    price_line = lines[i].strip()
+                while i < len(clean_lines):
+                    price_line = clean_lines[i].strip()
                     i += 1
                     if price_line and re.match(r'^\d+\.\d{2}$', price_line):
                         price = price_line
                         break
                 remise = ""
-                while i < len(lines):
-                    remise_line = lines[i].strip()
+                while i < len(clean_lines):
+                    remise_line = clean_lines[i].strip()
                     i += 1
                     remise = remise_line if remise_line else "0.00"
                     break
                 total = ""
-                while i < len(lines):
-                    total_line = lines[i].strip()
+                while i < len(clean_lines):
+                    total_line = clean_lines[i].strip()
                     i += 1
                     if total_line and re.match(r'^\d+\.\d{2}$', total_line):
                         total = total_line
@@ -91,65 +99,5 @@ def extract_data_from_cosmident(file):
                 break
             else:
                 description += " " + next_line
+
     return pd.DataFrame(results)
-
-def extract_desmos_acts(file):
-    doc = fitz.open(stream=file.read(), filetype="pdf")
-    full_text = ""
-    for page in doc:
-        full_text += page.get_text() + "\n"
-    lines = full_text.split('\n')
-    data = []
-    current_patient = None
-    current_acte = ""
-    current_hono = ""
-    for idx, line in enumerate(lines):
-        patient_match = re.search(r'Ref\. ([A-ZÉÈÇÂÊÎÔÛÄËÏÖÜÀÙa-zéèçâêîôûäëïöüàù\s\-]+)', line)
-        if patient_match:
-            # Nouveau patient, sauvegarde l'acte précédent si besoin
-            if current_patient and current_acte and current_hono:
-                data.append({'Patient': current_patient, 'Acte Desmos': current_acte.strip(), 'Prix Desmos': current_hono})
-            current_patient = patient_match.group(1).strip()
-            current_acte = ""
-            current_hono = ""
-        # Si la ligne contient un intitulé d'acte (ex : BIOTECH Pilier, Couronne transvissée, ZIRCONE, etc.)
-        elif re.search(r'(BIOTECH|Couronne transvissée|HBL\w+|ZIRCONE|GOUTTIÈRE SOUPLE|EMAX|ONLAY|PLAQUE|ADJONCTION|MONTAGE|DENT RESINE)', line, re.IGNORECASE):
-            current_acte = line.strip()
-            current_hono = ""
-        # Si la ligne contient Hono., on récupère le prix
-        elif "Hono" in line:
-            hono_match = re.search(r'Hono\.?\s*:?\s*([\d,\.]+)', line)
-            if hono_match:
-                current_hono = hono_match.group(1).replace(',', '.')
-        # Si la ligne suivante n'est pas un patient et contient un prix, on l'ajoute aussi
-        elif current_acte and re.match(r'^\d+[\.,]\d{2}$', line):
-            current_hono = line.replace(',', '.')
-    # Ajoute le dernier acte si besoin
-    if current_patient and current_acte and current_hono:
-        data.append({'Patient': current_patient, 'Acte Desmos': current_acte.strip(), 'Prix Desmos': current_hono})
-    return pd.DataFrame(data)
-
-def match_patient_and_acte(cosmident_patient, df_desmos):
-    cosmident_parts = set(cosmident_patient.lower().split())
-    for idx, row in df_desmos.iterrows():
-        desmos_patient = row['Patient']
-        desmos_parts = set(desmos_patient.lower().split())
-        if cosmident_patient.lower() == desmos_patient.lower() or len(cosmident_parts & desmos_parts) > 0:
-            return row['Acte Desmos'], row['Prix Desmos']
-    return "", ""
-
-if uploaded_cosmident and uploaded_desmos:
-    df_cosmident = extract_data_from_cosmident(uploaded_cosmident)
-    df_desmos = extract_desmos_acts(uploaded_desmos)
-    actes_desmos = []
-    prix_desmos = []
-    for patient in df_cosmident['Patient']:
-        acte, prix = match_patient_and_acte(patient, df_desmos)
-        actes_desmos.append(acte)
-        prix_desmos.append(prix)
-    df_cosmident['Acte Desmos'] = actes_desmos
-    df_cosmident['Prix Desmos'] = prix_desmos
-    st.success("✅ Extraction et fusion terminées")
-    st.dataframe(df_cosmident, use_container_width=True)
-else:
-    st.info("Veuillez charger les deux fichiers PDF (Cosmident et Desmos) pour lancer l'analyse.") 
