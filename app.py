@@ -21,12 +21,12 @@ def extract_text_from_image(image):
 
 
 # =====================
-# 🔹 Extraction Cosmident robuste
+# 🔹 Extraction Cosmident
 # =====================
 def extract_data_from_cosmident(file):
+    # On lit le fichier une seule fois
     file_bytes = file.read()
 
-    # --- Lecture du PDF ou image
     if file.type == "application/pdf":
         try:
             doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -38,10 +38,13 @@ def extract_data_from_cosmident(file):
         for page in doc:
             page_text = page.get_text("text")
 
-            # 🔹 Nettoyage du bas de page
-            stop_pattern = r'(COSMIDENT|IBAN|Siret|BIC|Tél\.|NOS COORDONNÉES BANCAIRES)'
-            page_text = re.split(stop_pattern, page_text, flags=re.IGNORECASE)[0]
+            # Coupe tout ce qui est après les mentions du bas de page
+            stop_pattern = r'(COSMIDENT|IBAN|Siret|BIC|Tél\.|Total \(Euros\)|TOTAL TTC|Règlement|Chèque|NOS COORDONNÉES BANCAIRES)'
+            cut = re.split(stop_pattern, page_text, flags=re.IGNORECASE)
+            page_text = cut[0] if cut else page_text
+
             full_text += page_text + "\n"
+
     else:
         try:
             image = Image.open(io.BytesIO(file_bytes))
@@ -50,20 +53,20 @@ def extract_data_from_cosmident(file):
             st.error(f"Erreur lecture image : {e}")
             return pd.DataFrame()
 
-    # Debug (désactivable)
+    # Option de débogage : montre un extrait du texte brut
     st.expander("🧩 Aperçu du texte extrait (Cosmident brut)").write(full_text[:2000])
 
-    # --- Nettoyage des lignes
+    # Nettoyage du texte
     lines = full_text.split('\n')
     clean_lines = []
     for line in lines:
         line = line.strip()
         if not line:
             continue
-        # Supprime les lignes inutiles (teintes, mentions)
+        # Supprime les lignes inutiles (teintes, mentions, totaux)
         if re.search(r'(teinte|couleur|A[1-3]|B[1-3]|C[1-3]|D[1-3])', line, re.IGNORECASE):
             continue
-        if re.search(r'(IBAN|Siret|BIC|COSMIDENT|€|Total \(Euros\)|TOTAL TTC)', line, re.IGNORECASE):
+        if re.search(r'(COSMIDENT|IBAN|Siret|BIC|€|Total \(Euros\)|TOTAL TTC|CHÈQUE)', line, re.IGNORECASE):
             continue
         clean_lines.append(line)
 
@@ -71,12 +74,11 @@ def extract_data_from_cosmident(file):
     current_patient = None
     i = 0
 
-    # --- Parcours du texte ligne par ligne
     while i < len(clean_lines):
         line = clean_lines[i]
         i += 1
 
-        # 🔹 Détection du patient
+        # Détection du patient
         ref_match = re.search(r'Ref\. ([\w\s\-]+)', line)
         if not ref_match:
             bon_match = re.match(r'Bon n°\d+ du [\w\d/]+.*Prescription \d+', line)
@@ -93,54 +95,41 @@ def extract_data_from_cosmident(file):
         if current_patient is None:
             continue
 
-        # --- Acte + prix
+        # Détection de l’acte et du prix
         description = line
-        found_price = None
-        found_total = None
-        quantity = 1
-
-        # 🔹 Balayage jusqu’à ce qu’on retrouve un motif de total ou de fin
         while i < len(clean_lines):
             next_line = clean_lines[i].strip()
             i += 1
             if not next_line:
                 continue
-
-            # Si une nouvelle Ref. ou Bon commence → stop (nouveau patient)
-            if re.search(r'^(Ref\.|Bon n°)', next_line, re.IGNORECASE):
-                i -= 1  # recule d'une ligne pour traiter le prochain bloc
+            if re.match(r'^\d+\.\d{2}$', next_line):
+                quantity = next_line
+                price = ""
+                while i < len(clean_lines):
+                    price_line = clean_lines[i].strip()
+                    i += 1
+                    if price_line and re.match(r'^\d+\.\d{2}$', price_line):
+                        price = price_line
+                        break
+                total = ""
+                while i < len(clean_lines):
+                    total_line = clean_lines[i].strip()
+                    i += 1
+                    if total_line and re.match(r'^\d+\.\d{2}$', total_line):
+                        total = total_line
+                        break
+                try:
+                    if float(price) > 0 and float(total) > 0:
+                        results.append({
+                            'Patient': current_patient,
+                            'Acte Cosmident': description,
+                            'Prix Cosmident': price
+                        })
+                except Exception:
+                    pass
                 break
-
-            # Si ligne = chiffre → potentiellement prix ou total
-            if re.match(r'^\d+[\.,]\d{2}$', next_line):
-                if found_price is None:
-                    found_price = float(next_line.replace(',', '.'))
-                elif found_total is None:
-                    found_total = float(next_line.replace(',', '.'))
-                continue
             else:
-                # Sinon, on concatène la description
                 description += " " + next_line
-
-            # Stop si on atteint "Total (Euros)" ou équivalent
-            if re.search(r'(Total \(Euros\)|TOTAL TTC)', next_line, re.IGNORECASE):
-                break
-
-        # 🔹 Détection du nombre de dents pour calcul éventuel
-        dents_match = re.findall(r'\b\d{2}\b', description)
-        if dents_match:
-            quantity = len(dents_match)
-
-        # 🔹 Calcul du total si absent
-        if found_price and not found_total:
-            found_total = found_price * quantity
-
-        if found_price and found_total and found_total > 0:
-            results.append({
-                'Patient': current_patient,
-                'Acte Cosmident': description.strip(),
-                'Prix Cosmident': f"{found_total:.2f}"
-            })
 
     return pd.DataFrame(results)
 
@@ -210,7 +199,7 @@ if uploaded_cosmident and uploaded_desmos:
     df_cosmident['Acte Desmos'] = actes_desmos
     df_cosmident['Prix Desmos'] = prix_desmos
 
-    st.success(f"✅ Extraction et fusion terminées — {len(df_cosmident)} actes trouvés.")
+    st.success("✅ Extraction et fusion terminées")
     st.dataframe(df_cosmident, use_container_width=True)
 else:
     st.info("Veuillez charger les deux fichiers PDF (Cosmident et Desmos) pour lancer l'analyse.")
