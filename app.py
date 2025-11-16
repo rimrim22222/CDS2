@@ -23,7 +23,7 @@ def extract_text_from_image(image):
     return pytesseract.image_to_string(image)
 
 # =====================
-# Extraction Cosmident (CORRIGÉE : PRIX BIEN AFFICHÉS)
+# Extraction Cosmident robuste (CORRIGÉE)
 # =====================
 def extract_data_from_cosmident(file):
     file_bytes = file.read()
@@ -47,6 +47,7 @@ def extract_data_from_cosmident(file):
             st.error(f"Erreur lecture image : {e}")
             return pd.DataFrame()
 
+    # Option débogage
     with st.expander("Aperçu du texte extrait (Cosmident brut)"):
         st.write(full_text[:2000])
 
@@ -60,6 +61,7 @@ def extract_data_from_cosmident(file):
             continue
         if re.search(r"(COSMIDENT|IBAN|Siret|BIC|€|TOTAL TTC|CHÈQUE)", line, re.IGNORECASE):
             continue
+        # MODIF 1 : Ignorer "OFFERT"
         if "OFFERT" in line.upper():
             continue
         clean_lines.append(line)
@@ -74,10 +76,9 @@ def extract_data_from_cosmident(file):
         line = clean_lines[i]
         i += 1
 
-        # --- Nouveau patient ---
+        # --- Patient ---
         ref_match = re.search(r"Ref\.?\s*(?:Patient\s*)?:?\s*([\w\s\-]+)", line, re.IGNORECASE)
         if ref_match:
-            # Sauvegarde acte précédent s'il est complet
             if current_patient and current_description and current_numbers:
                 try:
                     total = float(current_numbers[-1])
@@ -87,17 +88,18 @@ def extract_data_from_cosmident(file):
                             "Acte Cosmident": current_description.strip(),
                             "Prix Cosmident": f"{total:.2f}",
                         })
-                except:
+                except ValueError:
                     pass
             current_description = ""
             current_numbers = []
             current_patient = ref_match.group(1).strip()
             continue
 
-        # --- Bon n° + Ref. suivante ---
-        if re.match(r"Bon n°\d+ du [\w\d/]+", line) and i < len(clean_lines):
-            next_l = clean_lines[i]
-            ref_match = re.search(r"Ref\.?\s*(?:Patient\s*)?:?\s*([\w\s\-]+)", next_l, re.IGNORECASE)
+        # --- Bon n° + Ref. ---
+        bon_match = re.match(r"Bon n°\d+ du [\w\d/]+.*Prescription \d+", line)
+        if bon_match and i < len(clean_lines):
+            next_line = clean_lines[i].strip()
+            ref_match = re.search(r"Ref\.?\s*(?:Patient\s*)?:?\s*([\w\s\-]+)", next_line, re.IGNORECASE)
             if ref_match:
                 if current_patient and current_description and current_numbers:
                     try:
@@ -108,7 +110,7 @@ def extract_data_from_cosmident(file):
                                 "Acte Cosmident": current_description.strip(),
                                 "Prix Cosmident": f"{total:.2f}",
                             })
-                    except:
+                    except ValueError:
                         pass
                 current_description = ""
                 current_numbers = []
@@ -116,13 +118,20 @@ def extract_data_from_cosmident(file):
                 i += 1
                 continue
 
-        if not current_patient:
+        if current_patient is None:
             continue
 
-        # --- LIGNE PRIX SEUL → FIN D'ACTE (clé pour ANNA MARCINOW) ---
-        if re.match(r"^\d+[\.,]\d{2}$", line):
+        # --- MODIF 2 : Ligne prix seul (ex: 210.00 après ZIRCONE) ---
+        if re.match(r"^\d+[\.,]\d{2}$", line) and current_description:
             current_numbers.append(line.replace(",", "."))
-            # On sauvegarde l'acte immédiatement
+            continue
+
+        # --- Texte + nombres ---
+        this_numbers = re.findall(r"\d+[\.,]\d{2}", line)
+        norm_numbers = [n.replace(",", ".") for n in this_numbers]
+        this_text = re.sub(r"\s*\d+[\.,]\d{2}\s*", " ", line).strip()
+
+        if this_text:
             if current_description and current_numbers:
                 try:
                     total = float(current_numbers[-1])
@@ -132,22 +141,12 @@ def extract_data_from_cosmident(file):
                             "Acte Cosmident": current_description.strip(),
                             "Prix Cosmident": f"{total:.2f}",
                         })
-                except:
+                except ValueError:
                     pass
                 current_description = ""
                 current_numbers = []
-            continue
-
-        # --- Ligne avec texte + nombres (ex: "ZIRCONE ... 1.00 135.00 135.00") ---
-        this_numbers = re.findall(r"\d+[\.,]\d{2}", line)
-        norm_numbers = [n.replace(",", ".") for n in this_numbers]
-        this_text = re.sub(r"\s*\d+[\.,]\d{2}\s*", " ", line).strip()
-
-        # On accumule le texte
-        if this_text:
             current_description = this_text if not current_description else current_description + " " + this_text
 
-        # On accumule les nombres (quantité, prix intermédiaire, etc.)
         if norm_numbers:
             current_numbers.extend(norm_numbers)
 
@@ -161,13 +160,13 @@ def extract_data_from_cosmident(file):
                     "Acte Cosmident": current_description.strip(),
                     "Prix Cosmident": f"{total:.2f}",
                 })
-        except:
+        except ValueError:
             pass
 
     return pd.DataFrame(results)
 
 # =====================
-# Extraction Desmos (inchangée)
+# Extraction Desmos
 # =====================
 def extract_desmos_acts(file):
     doc = fitz.open(stream=file.read(), filetype="pdf")
@@ -179,14 +178,14 @@ def extract_desmos_acts(file):
     current_patient = None
     current_acte = ""
     current_hono = ""
-    for line in lines:
+    for idx, line in enumerate(lines):
         patient_match = re.search(r"Ref\. ([A-ZÉÈÇÂÊÎÔÛÄËÏÖÜÀÙa-zéèçâêîôûäëïöüàù\s\-]+)", line)
         if patient_match:
             if current_patient and current_acte and current_hono:
                 data.append({
                     "Patient": current_patient,
                     "Acte Desmos": current_acte.strip(),
-                    "Prix Desmos": current_hono
+                    "Prix Desmos": current_hono,
                 })
             current_patient = patient_match.group(1).strip()
             current_acte = ""
@@ -204,7 +203,7 @@ def extract_desmos_acts(file):
         data.append({
             "Patient": current_patient,
             "Acte Desmos": current_acte.strip(),
-            "Prix Desmos": current_hono
+            "Prix Desmos": current_hono,
         })
     return pd.DataFrame(data)
 
@@ -213,10 +212,10 @@ def extract_desmos_acts(file):
 # =====================
 def match_patient_and_acte(cosmident_patient, df_desmos):
     cosmident_parts = set(cosmident_patient.lower().split())
-    for _, row in df_desmos.iterrows():
+    for idx, row in df_desmos.iterrows():
         desmos_patient = row["Patient"]
         desmos_parts = set(desmos_patient.lower().split())
-        if cosmident_patient.lower() == desmos_patient.lower() or len(cosmident_parts & desmos_parts) >= 1:
+        if cosmident_patient.lower() == desmos_patient.lower() or len(cosmident_parts & desmos_parts) > 0:
             return row["Acte Desmos"], row["Prix Desmos"]
     return "", ""
 
@@ -236,7 +235,8 @@ if uploaded_cosmident and uploaded_desmos:
     st.subheader("2. Table issue du fichier PDF Desmos")
     st.dataframe(df_desmos, use_container_width=True)
 
-    actes_desmos, prix_desmos = [], []
+    actes_desmos = []
+    prix_desmos = []
     for patient in df_cosmident["Patient"]:
         acte, prix = match_patient_and_acte(patient, df_desmos)
         actes_desmos.append(acte)
