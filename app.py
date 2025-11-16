@@ -173,65 +173,68 @@ def extract_data_from_cosmident(file):
     return pd.DataFrame(results)
 
 # =====================
-# 🔹 Extraction Desmos
+# 🔹 Extraction DESMOS (NOUVELLE VERSION ROBUSTE)
 # =====================
 def extract_desmos_acts(file):
     doc = fitz.open(stream=file.read(), filetype="pdf")
     full_text = ""
     for page in doc:
         full_text += page.get_text() + "\n"
-    lines = full_text.split("\n")
 
+    lines = full_text.split("\n")
     data = []
     current_patient = None
     current_acte = ""
     current_hono = ""
 
-    for idx, line in enumerate(lines):
-        patient_match = re.search(
-            r"Ref\. ([A-ZÉÈÇÂÊÎÔÛÄËÏÖÜÀÙa-zéèçâêîôûäëïöüàù\s\-]+)", line
-        )
+    for line in lines:
+        l = line.strip()
+
+        # --- Patient ---
+        patient_match = re.search(r"Ref\.?\s*([A-Za-zÀ-ÖØ-öø-ÿ\s\-]+)", l)
         if patient_match:
             if current_patient and current_acte and current_hono:
-                data.append(
-                    {
-                        "Patient": current_patient,
-                        "Acte Desmos": current_acte.strip(),
-                        "Prix Desmos": current_hono,
-                    }
-                )
+                data.append({
+                    "Patient": current_patient,
+                    "Acte Desmos": current_acte,
+                    "Prix Desmos": current_hono
+                })
             current_patient = patient_match.group(1).strip()
             current_acte = ""
             current_hono = ""
-        elif re.search(
-            r"(BIOTECH|Couronne transvissée|HBL\w+|ZIRCONE|GOUTTIÈRE SOUPLE|EMAX|ONLAY|PLAQUE|ADJONCTION|MONTAGE|DENT RESINE)",
-            line,
-            re.IGNORECASE,
-        ):
-            current_acte = line.strip()
-            current_hono = ""
-        elif "Hono" in line:
-            hono_match = re.search(r"Hono\.?\s*:?\s*([\d,\.]+)", line)
-            if hono_match:
-                current_hono = hono_match.group(1).replace(",", ".")
-        elif current_acte and re.match(r"^\d+[\.,]\d{2}$", line):
-            current_hono = line.replace(",", ".")
+            continue
 
+        # --- Acte ---
+        if re.search(r"(BIOTECH|HBL|TRANSVISS|ZIRCONE|GOUTTI|EMAX|ONLAY|PLAQUE|MONTAGE|RESINE)", l, re.IGNORECASE):
+            current_acte = l
+            continue
+
+        # --- Prix (robuste) ---
+        price_match = re.search(r"(\d+[.,]\d{2})", l)
+
+        # ligne contenant Hono / Honoraires + prix
+        if ("hono" in l.lower() or "honor" in l.lower()) and price_match:
+            current_hono = price_match.group(1).replace(",", ".")
+            continue
+        
+        # ligne seule contenant un prix
+        if current_acte and not current_hono and price_match:
+            current_hono = price_match.group(1).replace(",", ".")
+            continue
+
+    # Ajouter le dernier bloc
     if current_patient and current_acte and current_hono:
-        data.append(
-            {
-                "Patient": current_patient,
-                "Acte Desmos": current_acte.strip(),
-                "Prix Desmos": current_hono,
-            }
-        )
+        data.append({
+            "Patient": current_patient,
+            "Acte Desmos": current_acte,
+            "Prix Desmos": current_hono
+        })
 
     return pd.DataFrame(data)
 
 # =====================
-# 🔹 Nouveau matching intelligent (incorporé)
+# 🔹 Matching intelligent
 # =====================
-
 def normalize_name(name):
     name = name.lower().strip()
     name = "".join(
@@ -252,19 +255,15 @@ def match_patient_and_acte(cosmident_patient, df_desmos):
     for idx, row in df_desmos.iterrows():
         desmos_norm = normalize_name(row["Patient"])
 
-        # 1) Exact
         if cosmident_norm == desmos_norm:
             return row["Acte Desmos"], row["Prix Desmos"]
 
-        # 2) Partie du nom
         if any(word in desmos_norm for word in cosmident_norm.split()):
             return row["Acte Desmos"], row["Prix Desmos"]
 
-        # 3) Mots communs
         if set(cosmident_norm.split()) & set(desmos_norm.split()):
             return row["Acte Desmos"], row["Prix Desmos"]
 
-        # 4) Similarité > 80%
         if name_similarity(cosmident_norm, desmos_norm) >= 0.80:
             return row["Acte Desmos"], row["Prix Desmos"]
 
