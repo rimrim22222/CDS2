@@ -67,6 +67,8 @@ def extract_data_from_cosmident(file):
     
     results = []
     current_patient = None
+    current_description = ""
+    current_numbers = []
     i = 0
     while i < len(clean_lines):
         line = clean_lines[i]
@@ -77,56 +79,102 @@ def extract_data_from_cosmident(file):
             line,
             re.IGNORECASE,
         )
-        if not ref_match:
-            bon_match = re.match(r"Bon n°\d+ du [\w\d/]+.*Prescription \d+", line)
-            if bon_match and i < len(clean_lines):
-                next_line = clean_lines[i].strip()
-                ref_match = re.search(
-                    r"Ref\.?\s*(?:Patient\s*)?:?\s*([\w\s\-]+)",
-                    next_line,
-                    re.IGNORECASE,
-                )
-                if ref_match:
-                    current_patient = ref_match.group(1).strip()
-                    i += 1
-                    continue
         if ref_match:
+            # Append previous act if any
+            if current_patient and current_description and len(current_numbers) > 0:
+                try:
+                    total = float(current_numbers[-1])
+                    if total > 0:
+                        results.append(
+                            {
+                                "Patient": current_patient,
+                                "Acte Cosmident": current_description.strip(),
+                                "Prix Cosmident": f"{total:.2f}",
+                            }
+                        )
+                except ValueError:
+                    pass
+            current_description = ""
+            current_numbers = []
             current_patient = ref_match.group(1).strip()
             continue
+        
+        bon_match = re.match(r"Bon n°\d+ du [\w\d/]+.*Prescription \d+", line)
+        if bon_match and i < len(clean_lines):
+            next_line = clean_lines[i].strip()
+            ref_match = re.search(
+                r"Ref\.?\s*(?:Patient\s*)?:?\s*([\w\s\-]+)",
+                next_line,
+                re.IGNORECASE,
+            )
+            if ref_match:
+                # Append previous act if any
+                if current_patient and current_description and len(current_numbers) > 0:
+                    try:
+                        total = float(current_numbers[-1])
+                        if total > 0:
+                            results.append(
+                                {
+                                    "Patient": current_patient,
+                                    "Acte Cosmident": current_description.strip(),
+                                    "Prix Cosmident": f"{total:.2f}",
+                                }
+                            )
+                    except ValueError:
+                        pass
+                current_description = ""
+                current_numbers = []
+                current_patient = ref_match.group(1).strip()
+                i += 1
+                continue
+        
         if current_patient is None:
             continue
-        # Détection de l’acte et récupération du TOTAL (dernière valeur numérique)
-        description = line
-        found_numbers = []
-        while i < len(clean_lines):
-            next_line = clean_lines[i].strip()
-            i += 1
-            if not next_line:
-                continue
-            # Fin d’acte si nouvelle Ref ou Bon
-            if re.search(r"^(Ref\.|Bon n°)", next_line, re.IGNORECASE):
-                i -= 1
-                break
-            # Nombres potentiels (quantité, prix, remise, total)
-            if re.match(r"^\d+[\.,]\d{2}$", next_line):
-                found_numbers.append(next_line.replace(",", "."))
-                continue
+        
+        # Process line for description and numbers
+        this_numbers = re.findall(r"\d+[\.,]\d{2}", line)
+        norm_numbers = [n.replace(",", ".") for n in this_numbers]
+        this_text = re.sub(r"\s*\d+[\.,]\d{2}\s*", " ", line).strip()
+        
+        if this_text:
+            if current_description and len(current_numbers) > 0:
+                try:
+                    total = float(current_numbers[-1])
+                    if total > 0:
+                        results.append(
+                            {
+                                "Patient": current_patient,
+                                "Acte Cosmident": current_description.strip(),
+                                "Prix Cosmident": f"{total:.2f}",
+                            }
+                        )
+                except ValueError:
+                    pass
+                current_description = ""
+                current_numbers = []
+            if current_description:
+                current_description += " " + this_text
             else:
-                description += " " + next_line
-        # On garde uniquement la dernière valeur numérique comme TOTAL
-        if found_numbers:
-            try:
-                total = float(found_numbers[-1])
-                if total > 0:
-                    results.append(
-                        {
-                            "Patient": current_patient,
-                            "Acte Cosmident": description.strip(),
-                            "Prix Cosmident": f"{total:.2f}",
-                        }
-                    )
-            except ValueError:
-                pass
+                current_description = this_text
+        
+        if norm_numbers:
+            current_numbers.extend(norm_numbers)
+    
+    # Append the last act if any
+    if current_patient and current_description and len(current_numbers) > 0:
+        try:
+            total = float(current_numbers[-1])
+            if total > 0:
+                results.append(
+                    {
+                        "Patient": current_patient,
+                        "Acte Cosmident": current_description.strip(),
+                        "Prix Cosmident": f"{total:.2f}",
+                    }
+                )
+        except ValueError:
+            pass
+    
     return pd.DataFrame(results)
 
 # =====================
