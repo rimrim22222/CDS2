@@ -27,14 +27,12 @@ def extract_text_from_image(image):
 # =====================
 def extract_data_from_cosmident(file):
     file_bytes = file.read()
-
     if file.type == "application/pdf":
         try:
             doc = fitz.open(stream=file_bytes, filetype="pdf")
         except Exception as e:
             st.error(f"Erreur ouverture PDF : {e}")
             return pd.DataFrame()
-
         full_text = ""
         for page in doc:
             page_text = page.get_text("text")
@@ -49,10 +47,11 @@ def extract_data_from_cosmident(file):
         except Exception as e:
             st.error(f"Erreur lecture image : {e}")
             return pd.DataFrame()
-
+    
     # Option débogage : aperçu du texte brut
-    st.expander("🧩 Aperçu du texte extrait (Cosmident brut)").write(full_text[:2000])
-
+    with st.expander("🧩 Aperçu du texte extrait (Cosmident brut)"):
+        st.write(full_text[:2000])
+    
     # Nettoyage du texte : on n’élimine pas les Ref ou Bon
     lines = full_text.split("\n")
     clean_lines = []
@@ -65,15 +64,13 @@ def extract_data_from_cosmident(file):
         if re.search(r"(COSMIDENT|IBAN|Siret|BIC|€|TOTAL TTC|CHÈQUE)", line, re.IGNORECASE):
             continue
         clean_lines.append(line)
-
+    
     results = []
     current_patient = None
     i = 0
-
     while i < len(clean_lines):
         line = clean_lines[i]
         i += 1
-
         # Détection robuste du patient
         ref_match = re.search(
             r"Ref\.?\s*(?:Patient\s*)?:?\s*([\w\s\-]+)",
@@ -98,29 +95,24 @@ def extract_data_from_cosmident(file):
             continue
         if current_patient is None:
             continue
-
         # Détection de l’acte et récupération du TOTAL (dernière valeur numérique)
         description = line
         found_numbers = []
-
         while i < len(clean_lines):
             next_line = clean_lines[i].strip()
             i += 1
             if not next_line:
                 continue
-
             # Fin d’acte si nouvelle Ref ou Bon
             if re.search(r"^(Ref\.|Bon n°)", next_line, re.IGNORECASE):
                 i -= 1
                 break
-
             # Nombres potentiels (quantité, prix, remise, total)
             if re.match(r"^\d+[\.,]\d{2}$", next_line):
                 found_numbers.append(next_line.replace(",", "."))
                 continue
             else:
                 description += " " + next_line
-
         # On garde uniquement la dernière valeur numérique comme TOTAL
         if found_numbers:
             try:
@@ -135,7 +127,6 @@ def extract_data_from_cosmident(file):
                     )
             except ValueError:
                 pass
-
     return pd.DataFrame(results)
 
 # =====================
@@ -209,21 +200,36 @@ def match_patient_and_acte(cosmident_patient, df_desmos):
 # 🔹 Interface principale
 # =====================
 if uploaded_cosmident and uploaded_desmos:
+    # Reset file pointers after reading in functions
+    uploaded_cosmident.seek(0)
+    uploaded_desmos.seek(0)
+    
     df_cosmident = extract_data_from_cosmident(uploaded_cosmident)
     df_desmos = extract_desmos_acts(uploaded_desmos)
-
+    
+    # Affichage pour debug : les 3 tables
+    st.subheader("1. Table issue du fichier PDF Cosmident (originale)")
+    st.dataframe(df_cosmident, use_container_width=True)
+    
+    st.subheader("2. Table issue du fichier PDF Desmos")
+    st.dataframe(df_desmos, use_container_width=True)
+    
+    # Fusion
     actes_desmos = []
     prix_desmos = []
     for patient in df_cosmident["Patient"]:
         acte, prix = match_patient_and_acte(patient, df_desmos)
         actes_desmos.append(acte)
         prix_desmos.append(prix)
-
-    df_cosmident["Acte Desmos"] = actes_desmos
-    df_cosmident["Prix Desmos"] = prix_desmos
-
-    st.success(f"✅ Extraction et fusion terminées — {len(df_cosmident)} actes trouvés")
-    st.dataframe(df_cosmident, use_container_width=True)
+    
+    df_merged = df_cosmident.copy()  # Copie pour ne pas modifier l'original
+    df_merged["Acte Desmos"] = actes_desmos
+    df_merged["Prix Desmos"] = prix_desmos
+    
+    st.subheader("3. Table issue de la fusion")
+    st.dataframe(df_merged, use_container_width=True)
+    
+    st.success(f"✅ Extraction et fusion terminées — {len(df_merged)} actes trouvés")
 else:
     st.info(
         "Veuillez charger les deux fichiers PDF (Cosmident et Desmos) pour lancer l'analyse."
