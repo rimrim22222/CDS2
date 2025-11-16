@@ -23,7 +23,7 @@ def extract_text_from_image(image):
     return pytesseract.image_to_string(image)
 
 # =====================
-# Extraction Cosmident (CORRIGÉE)
+# Extraction Cosmident (VERSION FINALE)
 # =====================
 def extract_data_from_cosmident(file):
     file_bytes = file.read()
@@ -47,9 +47,9 @@ def extract_data_from_cosmident(file):
             st.error(f"Erreur lecture image : {e}")
             return pd.DataFrame()
 
-    # Debug texte brut
+    # Debug
     with st.expander("Aperçu texte brut (Cosmident)"):
-        st.write(full_text[:4000] + ("..." if len(full_text) > 4000 else ""))
+        st.write(full_text[:5000] + ("..." if len(full_text) > 5000 else ""))
 
     lines = [ln.strip() for ln in full_text.split("\n") if ln.strip()]
     clean_lines = []
@@ -63,26 +63,27 @@ def extract_data_from_cosmident(file):
     results = []
     current_patient = None
     current_acte = ""
-    pending_price = None  # Prix en attente d’être rattaché
-
     i = 0
+
     while i < len(clean_lines):
         line = clean_lines[i]
         i += 1
 
-        # --- Patient ---
+        # --- Nouveau patient ---
         ref_match = re.search(r"Ref\.?\s*(?:Patient\s*)?:?\s*([\w\s\-\.]+)", line, re.IGNORECASE)
         if ref_match:
-            # Sauvegarde acte précédent
-            if current_patient and current_acte and pending_price:
-                results.append({
-                    "Patient": current_patient,
-                    "Acte Cosmident": current_acte.strip(),
-                    "Prix Cosmident": f"{float(pending_price):.2f}"
-                })
+            if current_patient and current_acte:
+                # Cherche le dernier prix dans l'acte
+                price_match = re.search(r"(\d+[\.,]\d{2})\s*$", current_acte)
+                if price_match:
+                    price = price_match.group(1).replace(",", ".")
+                    results.append({
+                        "Patient": current_patient,
+                        "Acte Cosmident": re.sub(r"\s*\d+[\.,]\d{2}\s*$", "", current_acte).strip(),
+                        "Prix Cosmident": f"{float(price):.2f}"
+                    })
             current_patient = ref_match.group(1).strip()
             current_acte = ""
-            pending_price = None
             continue
 
         # --- Bon n° + Ref. suivante ---
@@ -90,84 +91,77 @@ def extract_data_from_cosmident(file):
             next_l = clean_lines[i]
             ref_match = re.search(r"Ref\.?\s*(?:Patient\s*)?:?\s*([\w\s\-\.]+)", next_l, re.IGNORECASE)
             if ref_match:
-                if current_patient and current_acte and pending_price:
-                    results.append({
-                        "Patient": current_patient,
-                        "Acte Cosmident": current_acte.strip(),
-                        "Prix Cosmident": f"{float(pending_price):.2f}"
-                    })
+                if current_patient and current_acte:
+                    price_match = re.search(r"(\d+[\.,]\d{2})\s*$", current_acte)
+                    if price_match:
+                        price = price_match.group(1).replace(",", ".")
+                        results.append({
+                            "Patient": current_patient,
+                            "Acte Cosmident": re.sub(r"\s*\d+[\.,]\d{2}\s*$", "", current_acte).strip(),
+                            "Prix Cosmident": f"{float(price):.2f}"
+                        })
                 current_patient = ref_match.group(1).strip()
                 current_acte = ""
-                pending_price = None
                 i += 1
                 continue
 
         if not current_patient:
             continue
 
-        # --- Prix seul sur une ligne ---
-        price_match = re.match(r"^(\d+[\.,]\d{2})$", line)
-        if price_match:
-            price = price_match.group(1).replace(",", ".")
-            # Si on a un acte en cours → on l’associe
+        # --- Ligne avec acte + prix ---
+        # Ex: "ZIRCONE ... sur 16 1.00 135.00 135.00"
+        price_in_line = re.search(r"(\d+[\.,]\d{2})\s*$", line)
+        if price_in_line:
+            price = price_in_line.group(1).replace(",", ".")
+            acte_text = re.sub(r"\s*\d+[\.,]\d{2}\s*$", "", line).strip()
+            # Si on avait un acte en cours → on le termine
             if current_acte:
-                if pending_price:
-                    # Sauvegarde l’acte précédent avec son prix
+                prev_price = re.search(r"(\d+[\.,]\d{2})\s*$", current_acte)
+                if prev_price:
+                    p = prev_price.group(1).replace(",", ".")
                     results.append({
                         "Patient": current_patient,
-                        "Acte Cosmident": current_acte.strip(),
-                        "Prix Cosmident": f"{float(pending_price):.2f}"
+                        "Acte Cosmident": re.sub(r"\s*\d+[\.,]\d{2}\s*$", "", current_acte).strip(),
+                        "Prix Cosmident": f"{float(p):.2f}"
                     })
-                    current_acte = ""
-                pending_price = price
+            # Nouvel acte
+            current_acte = acte_text
+            results.append({
+                "Patient": current_patient,
+                "Acte Cosmident": acte_text,
+                "Prix Cosmident": f"{float(price):.2f}"
+            })
+            current_acte = ""
             continue
 
-        # --- Ligne avec texte + prix (ex: "ZIRCONE ... 210.00") ---
-        text_parts = re.split(r"\s+(\d+[\.,]\d{2})\s+", line)
-        text_clean = ""
-        extracted_price = None
-        for part in text_parts:
-            if re.match(r"^\d+[\.,]\d{2}$", part):
-                extracted_price = part.replace(",", ".")
+        # --- Ligne de description uniquement ---
+        if not re.match(r"^\d+[\.,]\d{2}$", line):
+            if current_acte:
+                current_acte += " " + line
             else:
-                if text_clean:
-                    text_clean += " " + part
-                else:
-                    text_clean = part
-
-        if extracted_price:
-            # Sauvegarde acte précédent s’il existe
-            if current_acte and pending_price:
-                results.append({
-                    "Patient": current_patient,
-                    "Acte Cosmident": current_acte.strip(),
-                    "Prix Cosmident": f"{float(pending_price):.2f}"
-                })
-            current_acte = text_clean.strip()
-            pending_price = extracted_price
+                current_acte = line
             continue
 
-        # --- Texte seul (description) ---
-        if text_clean := re.sub(r"\s*\d+[\.,]\d{2}\s*", " ", line).strip():
-            if not text_clean:
-                continue
-            # Si on avait un prix en attente → on termine l’acte
-            if current_acte and pending_price:
-                results.append({
-                    "Patient": current_patient,
-                    "Acte Cosmident": current_acte.strip(),
-                    "Prix Cosmident": f"{float(pending_price):.2f}"
-                })
-                pending_price = None
-            current_acte = text_clean if not current_acte else current_acte + " " + text_clean
+        # --- Ligne prix seul (fin d'acte) ---
+        if re.match(r"^\d+[\.,]\d{2}$", line) and current_acte:
+            price = line.replace(",", ".")
+            results.append({
+                "Patient": current_patient,
+                "Acte Cosmident": current_acte.strip(),
+                "Prix Cosmident": f"{float(price):.2f}"
+            })
+            current_acte = ""
 
     # Dernier acte
-    if current_patient and current_acte and pending_price:
-        results.append({
-            "Patient": current_patient,
-            "Acte Cosmident": current_acte.strip(),
-            "Prix Cosmident": f"{float(pending_price):.2f}"
-        })
+    if current_patient and current_acte:
+        price_match = re.search(r"(\d+[\.,]\d{2})\s*$", current_acte)
+        if price_match:
+            price = price_match.group(1).replace(",", ".")
+            results.append({
+                "Patient": current_patient,
+                "Acte Cosmident": re.sub(r"\s*\d+[\.,]\d{2}\s*$", "", current_acte).strip(),
+                "Prix Cosmident": f"{float(price):.2f}"
+            })
 
     return pd.DataFrame(results)
 
@@ -235,14 +229,12 @@ if uploaded_cosmident and uploaded_desmos:
     df_cosmident = extract_data_from_cosmident(uploaded_cosmident)
     df_desmos = extract_desmos_acts(uploaded_desmos)
 
-    # === DEBUG : 3 TABLES ===
-    st.subheader("1. Table Cosmident (extraite)")
+    st.subheader("1. Table Cosmident")
     st.dataframe(df_cosmident, use_container_width=True)
 
-    st.subheader("2. Table Desmos (extraite)")
+    st.subheader("2. Table Desmos")
     st.dataframe(df_desmos, use_container_width=True)
 
-    # Fusion
     actes_desmos, prix_desmos = [], []
     for patient in df_cosmident["Patient"]:
         acte, prix = match_patient_and_acte(patient, df_desmos)
@@ -258,4 +250,4 @@ if uploaded_cosmident and uploaded_desmos:
 
     st.success(f"Extraction et fusion terminées — {len(df_merged)} actes trouvés")
 else:
-    st.info("Veuillez charger les deux fichiers PDF pour lancer l'analyse.")
+    st.info("Veuillez charger les deux fichiers PDF.")
