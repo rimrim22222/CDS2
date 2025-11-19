@@ -7,15 +7,14 @@ import pytesseract
 import io
 from difflib import SequenceMatcher
 
-st.set_page_config(page_title="Fusion HBL + Cosmident/Desmos", layout="wide")
-st.title("📊 Fusion des actes HBL et Cosmident/Desmos par patient")
+st.set_page_config(page_title="Fusion HBL + Cosmident", layout="wide")
+st.title("📊 Fusion des actes HBL et Cosmident par patient")
 
 # =====================
 # 🔹 Uploads
 # =====================
 uploaded_excel = st.file_uploader("Upload ton fichier Excel HBL", type=["xls", "xlsx"])
 uploaded_cosmident = st.file_uploader("Upload le fichier Cosmident (PDF ou image)", type=["pdf", "png", "jpg", "jpeg"])
-uploaded_desmos = st.file_uploader("Upload le fichier Desmos (PDF)", type=["pdf"])
 
 # =====================
 # 🔹 Fonction utilitaire pour comparer noms avec tolérance
@@ -147,87 +146,46 @@ def extract_cosmident(file):
     return df
 
 # =====================
-# 🔹 Extraction Desmos
-# =====================
-def extract_desmos(file):
-    doc = fitz.open(stream=file.read(), filetype="pdf")
-    full_text=""
-    for page in doc: full_text+=page.get_text()+"\n"
-    lines = full_text.split("\n")
-    data=[]
-    current_patient=None
-    current_acte=""
-    current_hono=""
-    for line in lines:
-        pm = re.search(r"Ref\. ([A-ZÉÈÇÂÊÎÔÛÄËÏÖÜÀÙa-zéèçâêîôûäëïöüàù\s\-]+)",line)
-        if pm:
-            current_patient=pm.group(1).strip()
-            current_acte=""
-            current_hono=""
-        elif re.search(r"(BIOTECH|Couronne|HBL\w+|ZIRCONE|EMAX|ONLAY|PLAQUE|ADJONCTION)",line,re.I):
-            current_acte=line.strip()
-        elif "Hono" in line:
-            hm = re.search(r"Hono\.?\s*:?\s*([\d,\.]+)",line)
-            if hm: current_hono=hm.group(1).replace(",",".")
-
-        elif current_acte and re.match(r"^\d+[\.,]\d{2}$",line):
-            current_hono=line.replace(",",".")
-
-        if current_patient and current_acte and current_hono:
-            data.append({"Patient":current_patient,"Acte Desmos":current_acte,"Prix Desmos":current_hono})
-
-    return pd.DataFrame(data)
-
-# =====================
 # 🔹 Fusion intelligente
 # =====================
-def fuse_patients(df_hbl, df_cosm, df_desmos):
-    all_patients = set(df_hbl["Patient"].unique()) | set(df_cosm["Patient"].unique()) | set(df_desmos["Patient"].unique())
+def fuse_patients(df_hbl, df_cosm):
+    all_patients = set(df_hbl["Patient"].unique()) | set(df_cosm["Patient"].unique())
     fusion = []
     for pat in all_patients:
-        # Match HBL
         hbl_rows = df_hbl[df_hbl["Patient"].apply(lambda x: similar(x,pat)>0.85)]
         cosm_rows = df_cosm[df_cosm["Patient"].apply(lambda x: similar(x,pat)>0.85)]
-        desmos_rows = df_desmos[df_desmos["Patient"].apply(lambda x: similar(x,pat)>0.85)]
 
         fusion.append({
             "Patient": pat,
             "HBL": hbl_rows.to_dict(orient="records"),
-            "Cosmident": cosm_rows.to_dict(orient="records"),
-            "Desmos": desmos_rows.to_dict(orient="records")
+            "Cosmident": cosm_rows.to_dict(orient="records")
         })
     return fusion
 
 # =====================
 # 🔹 Interface principale
 # =====================
-if uploaded_excel and uploaded_cosmident and uploaded_desmos:
+if uploaded_excel and uploaded_cosmident:
     uploaded_excel.seek(0)
     uploaded_cosmident.seek(0)
-    uploaded_desmos.seek(0)
 
     df_hbl = extract_hbl(uploaded_excel)
     df_cosm = extract_cosmident(uploaded_cosmident)
-    df_desmos = extract_desmos(uploaded_desmos)
 
     st.subheader("Table HBL")
     st.dataframe(df_hbl)
     st.subheader("Table Cosmident")
     st.dataframe(df_cosm)
-    st.subheader("Table Desmos")
-    st.dataframe(df_desmos)
 
-    fusion = fuse_patients(df_hbl, df_cosm, df_desmos)
+    fusion = fuse_patients(df_hbl, df_cosm)
 
-    st.subheader("Fusion par patient (HBL + Cosmident + Desmos)")
+    st.subheader("Fusion par patient (HBL + Cosmident)")
     for f in fusion:
         st.markdown(f"### Patient : {f['Patient']}")
         st.markdown("**HBL**")
         st.json(f['HBL'])
         st.markdown("**Cosmident**")
         st.json(f['Cosmident'])
-        st.markdown("**Desmos**")
-        st.json(f['Desmos'])
         st.markdown("---")
 else:
-    st.info("Charge les 3 fichiers pour lancer la fusion.")
+    st.info("Charge les fichiers Excel HBL et Cosmident pour lancer la fusion.")
