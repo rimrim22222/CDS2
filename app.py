@@ -26,7 +26,7 @@ def extract_data_from_cosmident(file):
             doc = fitz.open(stream=file_bytes, filetype="pdf")
         except Exception as e:
             st.error(f"Erreur ouverture PDF : {e}")
-            return pd.DataFrame()
+            return pd.DataFrame(columns=["Patient", "Acte Cosmident", "Prix Cosmident"])
         full_text = ""
         for page in doc:
             page_text = page.get_text("text")
@@ -39,7 +39,7 @@ def extract_data_from_cosmident(file):
             full_text = pytesseract.image_to_string(image)
         except Exception as e:
             st.error(f"Erreur lecture image : {e}")
-            return pd.DataFrame()
+            return pd.DataFrame(columns=["Patient", "Acte Cosmident", "Prix Cosmident"])
 
     # Nettoyage du texte
     lines = full_text.split("\n")
@@ -72,7 +72,6 @@ def extract_data_from_cosmident(file):
             continue
 
         # --- Gestion lignes avec plusieurs actes/prix ---
-        # Exemple: "ZIRCONE MULTILAYER sur 15, 25, 35 3.00 70.00 210.00"
         groups = re.findall(r"([A-ZÉÈÇÂÊÎÔÛÄËÏÖÜa-zéèçâêîôûäëïöü0-9\(\)\s\-,]+?)\s((?:\d+[\.,]\d{2}\s?)+)", line)
         for desc, prix_str in groups:
             prix_list = [p.replace(",", ".") for p in prix_str.strip().split()]
@@ -101,7 +100,11 @@ def extract_data_from_cosmident(file):
         st.text(f"Actes trouvés : {d['Actes trouvés']}")
         st.markdown("---")
 
-    return pd.DataFrame(results)
+    # Forcer les colonnes même si résultats vides
+    df = pd.DataFrame(results)
+    if df.empty:
+        df = pd.DataFrame(columns=["Patient", "Acte Cosmident", "Prix Cosmident"])
+    return df
 
 # =====================
 # 🔹 Extraction Desmos
