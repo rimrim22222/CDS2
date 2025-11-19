@@ -1,5 +1,8 @@
 streamlit
 pdfplumber
 pymupdf
+pyexcel-xls
+pillow
+unidecode
 pandas
 pytesseract
