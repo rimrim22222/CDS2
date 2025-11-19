@@ -17,7 +17,7 @@ uploaded_desmos = st.file_uploader(
 )
 
 # =====================
-# 🔹 Extraction Cosmident robuste
+# 🔹 Extraction Cosmident robuste avec debug
 # =====================
 def extract_data_from_cosmident(file):
     file_bytes = file.read()
@@ -52,8 +52,8 @@ def extract_data_from_cosmident(file):
         line = line.strip()
         if not line:
             continue
-        # --- IGNORER LES LIGNES TEINTE ---
-        if re.search(r"Teinte dentine|teinte|Vitapan|A[1-3]|B[1-3]|C[1-3]|D[1-3]", line, re.IGNORECASE):
+        # Ignorer uniquement les lignes qui sont purement des teintes (sans acte)
+        if re.match(r"^(Teinte dentine|Vitapan|A[1-3]|B[1-3]|C[1-3]|D[1-3])\s*:?", line, re.IGNORECASE):
             continue
         # Ignorer les mentions bancaires ou totaux
         if re.search(r"(COSMIDENT|IBAN|Siret|BIC|€|TOTAL TTC|CHÈQUE)", line, re.IGNORECASE):
@@ -64,6 +64,13 @@ def extract_data_from_cosmident(file):
     current_patient = None
     current_description = ""
     current_numbers = []
+    
+    # ---------------------
+    # 🔹 Debug sur les 2 dernières pages
+    total_lines = len(clean_lines)
+    debug_max_lines = 2 * 50  # approx 2 dernières pages = 100 lignes
+    debug_lines = []
+    
     i = 0
     while i < len(clean_lines):
         line = clean_lines[i]
@@ -73,19 +80,16 @@ def extract_data_from_cosmident(file):
         ref_match = re.search(r"Ref\.?\s*(?:Patient\s*)?:?\s*([\w\s\-]+)", line, re.IGNORECASE)
         if ref_match:
             if current_patient and current_description and len(current_numbers) > 0:
-                try:
-                    total = float(current_numbers[-1])
-                    if total > 0:
-                        results.append({
-                            "Patient": current_patient,
-                            "Acte Cosmident": current_description.strip(),
-                            "Prix Cosmident": f"{total:.2f}",
-                        })
-                except ValueError:
-                    pass
+                total = float(current_numbers[-1])
+                if total > 0:
+                    results.append({
+                        "Patient": current_patient,
+                        "Acte Cosmident": current_description.strip(),
+                        "Prix Cosmident": f"{total:.2f}",
+                    })
+            current_patient = ref_match.group(1).strip()
             current_description = ""
             current_numbers = []
-            current_patient = ref_match.group(1).strip()
             continue
         
         # Détection via Bon n° ... Prescription ...
@@ -95,33 +99,6 @@ def extract_data_from_cosmident(file):
             ref_match = re.search(r"Ref\.?\s*(?:Patient\s*)?:?\s*([\w\s\-]+)", next_line, re.IGNORECASE)
             if ref_match:
                 if current_patient and current_description and len(current_numbers) > 0:
-                    try:
-                        total = float(current_numbers[-1])
-                        if total > 0:
-                            results.append({
-                                "Patient": current_patient,
-                                "Acte Cosmident": current_description.strip(),
-                                "Prix Cosmident": f"{total:.2f}",
-                            })
-                    except ValueError:
-                        pass
-                current_description = ""
-                current_numbers = []
-                current_patient = ref_match.group(1).strip()
-                i += 1
-                continue
-        
-        if current_patient is None:
-            continue
-        
-        # Process line for description and numbers
-        this_numbers = re.findall(r"\d+[\.,]\d{2}", line)
-        norm_numbers = [n.replace(",", ".") for n in this_numbers]
-        this_text = re.sub(r"\s*\d+[\.,]\d{2}\s*", " ", line).strip()
-        
-        if this_text:
-            if current_description and len(current_numbers) > 0:
-                try:
                     total = float(current_numbers[-1])
                     if total > 0:
                         results.append({
@@ -129,30 +106,58 @@ def extract_data_from_cosmident(file):
                             "Acte Cosmident": current_description.strip(),
                             "Prix Cosmident": f"{total:.2f}",
                         })
-                except ValueError:
-                    pass
+                current_patient = ref_match.group(1).strip()
                 current_description = ""
                 current_numbers = []
-            if current_description:
-                current_description += " " + this_text
-            else:
-                current_description = this_text
+                i += 1
+                continue
         
-        if norm_numbers:
-            current_numbers.extend(norm_numbers)
+        if current_patient is None:
+            continue
+
+        # Séparer texte et nombres
+        all_numbers = re.findall(r"\d+[\.,]\d{2}", line)
+        # Ne garder que ceux >48 → prix
+        prices = [n.replace(",", ".") for n in all_numbers if float(n.replace(",", ".")) > 48]
+        if prices:
+            current_numbers.extend(prices)
+        
+        # Texte de l'acte : retirer uniquement les prix (laisser dents et parenthèses)
+        text_only = re.sub(r"\b\d+[\.,]\d{2}\b", "", line).strip()
+        if text_only:
+            if current_description:
+                current_description += " " + text_only
+            else:
+                current_description = text_only
+        
+        # --- Debug pour les 2 dernières pages ---
+        if i > total_lines - debug_max_lines:
+            debug_lines.append({
+                "Ligne relative": i,
+                "Patient courant": current_patient,
+                "Texte brut": line,
+                "Description en cours": current_description,
+                "Prix détectés": current_numbers.copy()
+            })
     
-    # Ajouter le dernier acte si présent
+    # Ajouter le dernier acte
     if current_patient and current_description and len(current_numbers) > 0:
-        try:
-            total = float(current_numbers[-1])
-            if total > 0:
-                results.append({
-                    "Patient": current_patient,
-                    "Acte Cosmident": current_description.strip(),
-                    "Prix Cosmident": f"{total:.2f}",
-                })
-        except ValueError:
-            pass
+        total = float(current_numbers[-1])
+        if total > 0:
+            results.append({
+                "Patient": current_patient,
+                "Acte Cosmident": current_description.strip(),
+                "Prix Cosmident": f"{total:.2f}",
+            })
+    
+    # Affichage debug
+    st.subheader("DEBUG : Aperçu des 2 dernières pages Cosmident")
+    for d in debug_lines:
+        st.markdown(f"**Ligne {d['Ligne relative']}** | Patient : `{d['Patient courant']}`")
+        st.text(f"Texte brut : {d['Texte brut']}")
+        st.text(f"Description en cours : {d['Description en cours']}")
+        st.text(f"Prix détectés : {d['Prix détectés']}")
+        st.markdown("---")
     
     return pd.DataFrame(results)
 
