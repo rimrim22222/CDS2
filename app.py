@@ -17,7 +17,7 @@ uploaded_desmos = st.file_uploader(
 )
 
 # =====================
-# 🔹 Extraction Cosmident robuste
+# 🔹 Extraction Cosmident robuste avec debug
 # =====================
 def extract_data_from_cosmident(file):
     file_bytes = file.read()
@@ -64,6 +64,11 @@ def extract_data_from_cosmident(file):
     current_patient = None
     current_description = ""
     current_numbers = []
+    debug_lines = []
+    
+    total_lines = len(clean_lines)
+    debug_max_lines = 2 * 50  # approx 2 dernières pages
+    
     i = 0
     while i < len(clean_lines):
         line = clean_lines[i]
@@ -140,6 +145,16 @@ def extract_data_from_cosmident(file):
         
         if norm_numbers:
             current_numbers.extend(norm_numbers)
+        
+        # --- DEBUG : lignes des 2 dernières pages ---
+        if i > total_lines - debug_max_lines:
+            debug_lines.append({
+                "Ligne relative": i,
+                "Patient courant": current_patient,
+                "Texte brut": line,
+                "Description en cours": current_description,
+                "Prix détectés": current_numbers.copy()
+            })
     
     # Ajouter le dernier acte si présent
     if current_patient and current_description and len(current_numbers) > 0:
@@ -153,6 +168,15 @@ def extract_data_from_cosmident(file):
                 })
         except ValueError:
             pass
+    
+    # Affichage debug
+    st.subheader("DEBUG : Aperçu des 2 dernières pages Cosmident")
+    for d in debug_lines:
+        st.markdown(f"**Ligne {d['Ligne relative']}** | Patient : `{d['Patient courant']}`")
+        st.text(f"Texte brut : {d['Texte brut']}")
+        st.text(f"Description en cours : {d['Description en cours']}")
+        st.text(f"Prix détectés : {d['Prix détectés']}")
+        st.markdown("---")
     
     return pd.DataFrame(results)
 
