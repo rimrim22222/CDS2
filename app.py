@@ -1,12 +1,25 @@
-def extract_data_from_cosmident(file):
-    import io
-    from PIL import Image
-    import fitz
-    import re
-    import streamlit as st
-    import pandas as pd
-    import pytesseract
+import streamlit as st
+import fitz  # PyMuPDF
+import re
+import pandas as pd
+from PIL import Image
+import pytesseract
+import io
 
+st.set_page_config(page_title="Analyse Cosmident + Desmos", layout="wide")
+st.title("📄 Analyse des actes dentaires Cosmident + Desmos")
+
+uploaded_cosmident = st.file_uploader(
+    "Upload le fichier Cosmident (PDF ou image)", type=["pdf", "png", "jpg", "jpeg"]
+)
+uploaded_desmos = st.file_uploader(
+    "Upload le fichier Desmos (PDF)", type=["pdf"], key="desmos"
+)
+
+# =====================
+# 🔹 Extraction Cosmident robuste
+# =====================
+def extract_data_from_cosmident(file):
     file_bytes = file.read()
     if file.type == "application/pdf":
         try:
@@ -121,3 +134,103 @@ def extract_data_from_cosmident(file):
             })
     
     return pd.DataFrame(results)
+
+# =====================
+# 🔹 Extraction Desmos
+# =====================
+def extract_desmos_acts(file):
+    doc = fitz.open(stream=file.read(), filetype="pdf")
+    full_text = ""
+    for page in doc:
+        full_text += page.get_text() + "\n"
+    lines = full_text.split("\n")
+    data = []
+    current_patient = None
+    current_acte = ""
+    current_hono = ""
+    for idx, line in enumerate(lines):
+        patient_match = re.search(
+            r"Ref\. ([A-ZÉÈÇÂÊÎÔÛÄËÏÖÜÀÙa-zéèçâêîôûäëïöüàù\s\-]+)", line
+        )
+        if patient_match:
+            if current_patient and current_acte and current_hono:
+                data.append({
+                    "Patient": current_patient,
+                    "Acte Desmos": current_acte.strip(),
+                    "Prix Desmos": current_hono,
+                })
+            current_patient = patient_match.group(1).strip()
+            current_acte = ""
+            current_hono = ""
+        elif re.search(
+            r"(BIOTECH|Couronne transvissée|HBL\w+|ZIRCONE|GOUTTIÈRE SOUPLE|EMAX|ONLAY|PLAQUE|ADJONCTION|MONTAGE|DENT RESINE)",
+            line,
+            re.IGNORECASE,
+        ):
+            current_acte = line.strip()
+            current_hono = ""
+        elif "Hono" in line:
+            hono_match = re.search(r"Hono\.?\s*:?\s*([\d,\.]+)", line)
+            if hono_match:
+                current_hono = hono_match.group(1).replace(",", ".")
+        elif current_acte and re.match(r"^\d+[\.,]\d{2}$", line):
+            current_hono = line.replace(",", ".")
+    if current_patient and current_acte and current_hono:
+        data.append({
+            "Patient": current_patient,
+            "Acte Desmos": current_acte.strip(),
+            "Prix Desmos": current_hono,
+        })
+    return pd.DataFrame(data)
+
+# =====================
+# 🔹 Matching Cosmident / Desmos
+# =====================
+def match_patient_and_acte(cosmident_patient, df_desmos):
+    cosmident_parts = set(cosmident_patient.lower().split())
+    for idx, row in df_desmos.iterrows():
+        desmos_patient = row["Patient"]
+        desmos_parts = set(desmos_patient.lower().split())
+        if (
+            cosmident_patient.lower() == desmos_patient.lower()
+            or len(cosmident_parts & desmos_parts) > 0
+        ):
+            return row["Acte Desmos"], row["Prix Desmos"]
+    return "", ""
+
+# =====================
+# 🔹 Interface principale
+# =====================
+if uploaded_cosmident and uploaded_desmos:
+    uploaded_cosmident.seek(0)
+    uploaded_desmos.seek(0)
+    
+    df_cosmident = extract_data_from_cosmident(uploaded_cosmident)
+    df_desmos = extract_desmos_acts(uploaded_desmos)
+    
+    st.subheader("1. Table issue du fichier PDF Cosmident (originale)")
+    st.dataframe(df_cosmident, use_container_width=True)
+    
+    st.subheader("2. Table issue du fichier PDF Desmos")
+    st.dataframe(df_desmos, use_container_width=True)
+    
+    # Fusion
+    actes_desmos = []
+    prix_desmos = []
+    for patient in df_cosmident["Patient"]:
+        acte, prix = match_patient_and_acte(patient, df_desmos)
+        actes_desmos.append(acte)
+        prix_desmos.append(prix)
+    
+    df_merged = df_cosmident.copy()
+    df_merged["Acte Desmos"] = actes_desmos
+    df_merged["Prix Desmos"] = prix_desmos
+    
+    st.subheader("3. Table issue de la fusion")
+    st.dataframe(df_merged, use_container_width=True)
+    
+    st.success(f"✅ Extraction et fusion terminées — {len(df_merged)} actes trouvés")
+else:
+    st.info(
+        "Veuillez charger les deux fichiers PDF (Cosmident et Desmos) pour lancer l'analyse."
+    )
