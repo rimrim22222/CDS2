@@ -31,16 +31,22 @@ else:
     st.caption("Logo manquant → place logo.png à la racine de l’app")
 
 st.title("Gestion des Prothèses — Desmos (Excel) + Cosmident (PDF)")
-st.caption("Comparaison **uniquement** par nom patient (normalisation + fuzzy tokens). Ajout des colonnes Cosmident (Acte, €).")
+st.caption("Comparaison **uniquement** par nom patient (normalisation + fuzzy). Debug PDF enrichi : texte + lignes extraites Cosmident.")
 
 # ==================== SIDEBAR PARAMS ====================
 with st.sidebar:
     st.subheader("Paramètres")
+    # Debug
     debug_desmos = st.toggle("Debug Desmos (premières lignes)", value=False)
     max_debug_rows_desmos = st.number_input("Lignes debug Desmos", min_value=10, max_value=2000, value=150, step=10)
 
-    debug_pdf = st.toggle("Debug Cosmident PDF (texte des pages)", value=False)
+    debug_pdf = st.toggle("Debug Cosmident PDF (texte + actes par page)", value=True)
     max_debug_pages_pdf = st.number_input("Pages debug PDF", min_value=1, max_value=100, value=4, step=1)
+
+    # Nouveaux panneaux debug
+    show_cosmident_rows = st.checkbox("Afficher résultats Cosmident (bruts)", value=True)
+    show_cosmident_agg  = st.checkbox("Afficher agrégation Cosmident par patient", value=True)
+    show_fuzzy_mapping  = st.checkbox("Afficher mapping fuzzy appliqué (avec score)", value=True)
 
     st.markdown("---")
     st.caption("Filtres Codes (appliqués aux deux sources)")
@@ -59,7 +65,7 @@ with st.sidebar:
     st.markdown("---")
     use_fuzzy = st.checkbox("Activer la correspondance floue", value=True)
     fuzzy_threshold = st.slider("Seuil de similarité (0–100)", min_value=60, max_value=100, value=80, step=1)
-    show_candidates = st.checkbox("Afficher les meilleurs candidats pour les non appariés", value=True)
+    show_candidates = st.checkbox("Afficher les meilleurs candidats (pour non appariés)", value=True)
 
     st.markdown("---")
     search_text = st.text_input("Recherche plein texte (toutes colonnes)", "")
@@ -80,9 +86,9 @@ def normalize_patient(name: str) -> str:
     Normalise le nom patient :
     - supprime accents
     - MAJ
-    - remplace ponctuation/traits/apostrophes par espaces
-    - compresse espaces (incl. NBSP)
-    - découpe en tokens et les trie (inversion NOM/PRÉNOM gérée)
+    - ponctuation->espaces
+    - compresse espaces
+    - tokens triés (gère inversion NOM/PRÉNOM)
     """
     if not isinstance(name, str):
         name = str(name) if name is not None else ""
@@ -115,13 +121,6 @@ def to_float_eu(x):
 
 # ========== Similarité par tokens (tolère petites fautes d’orthographe) ==========
 def token_similarity(a: str, b: str) -> int:
-    """
-    Score 0..100 basé sur appariement des tokens.
-    Approche :
-      - pour chaque token de a, on cherche le meilleur token dans b
-      - moyenne des meilleurs scores (RapidFuzz si dispo, sinon difflib)
-      - pénalité si b a des tokens non appariés (symétrie approximative)
-    """
     ta = tokens_from_norm(a)
     tb = tokens_from_norm(b)
     if not ta or not tb:
@@ -129,26 +128,20 @@ def token_similarity(a: str, b: str) -> int:
 
     def best_score_for_token(tok, pool):
         if RF_AVAILABLE:
-            # token vs meilleur dans pool
             m = process.extractOne(tok, pool, scorer=fuzz.ratio)
             return m[1] if m else 0
-        # difflib fallback
         best = 0
         for cand in pool:
-            s = int(difflib.SequenceMatcher(None, tok, cand).ratio() * 100) if RF_AVAILABLE is False else 0
+            s = int(difflib.SequenceMatcher(None, tok, cand).ratio() * 100)
             if s > best:
                 best = s
         return best
 
     scores_a = [best_score_for_token(t, tb) for t in ta]
     scores_b = [best_score_for_token(t, ta) for t in tb]
-
-    # moyenne bidirectionnelle
     avg_a = sum(scores_a) / len(scores_a)
     avg_b = sum(scores_b) / len(scores_b)
     score = (avg_a + avg_b) / 2
-
-    # pénalité si tailles très différentes
     size_penalty = 100 * abs(len(ta) - len(tb)) / max(len(ta), len(tb))
     final = max(0, int(score - 0.5 * size_penalty))
     return final
@@ -214,8 +207,6 @@ def style_summary_to_excel(df_sum: pd.DataFrame, sheet_name="Récap") -> BytesIO
             if "Total (€)" in df_sum.columns:
                 col_idx = df_sum.columns.get_loc("Total (€)")
                 worksheet.set_column(col_idx, col_idx, None, money_fmt)
-    output.seek(0)
-    return output
 
 # ==================== PARSING DESMOS (Excel) ====================
 def is_header_line(text_upper: str) -> bool:
@@ -383,6 +374,10 @@ def expand_multi_dents(dent_str):
     return [s]
 
 def parse_cosmident_pdf(cosmi_pdf_bytes: bytes, exclude_hbld490=True, exclude_hbld045=True, duplicate_multi_dents=False, debug=False, max_debug_pages=4):
+    """
+    Retourne df des résultats Cosmident.
+    En mode debug: affiche pour chaque page le TEXTE + les ACTES détectés sur la page.
+    """
     if fitz is None:
         st.error("PyMuPDF (fitz) n'est pas installé. Installe-le pour parser le PDF Cosmident.")
         return pd.DataFrame()
@@ -395,9 +390,13 @@ def parse_cosmident_pdf(cosmi_pdf_bytes: bytes, exclude_hbld490=True, exclude_hb
         text = page.get_text("text")
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
 
+        # --- DEBUG TEXTE DE LA PAGE ---
         if debug and pno < max_debug_pages:
-            st.write(f"**Cosmident Page {pno+1}/{len(doc)}** — aperçu texte")
-            st.code("\n".join(lines[:150]))
+            st.write(f"**Cosmident — Page {pno+1}/{len(doc)}** : texte brut")
+            st.code("\n".join(lines[:200]))
+
+        # collecte des lignes extraites sur la page (pour debug)
+        page_rows = []
 
         current_patient = None
         for i, line in enumerate(lines):
@@ -426,7 +425,18 @@ def parse_cosmident_pdf(cosmi_pdf_bytes: bytes, exclude_hbld490=True, exclude_hb
 
             dents_list = expand_multi_dents(dent) if duplicate_multi_dents else [dent]
             for d in dents_list:
-                results.append({"Patient": current_patient, "Dent": d, "Code": code, "Acte_Cosmident": acte, "Tarif_Cosmident": tarif})
+                row = {"Patient": current_patient, "Dent": d, "Code": code, "Acte_Cosmident": acte, "Tarif_Cosmident": tarif}
+                results.append(row)
+                page_rows.append(row)
+
+        # --- DEBUG ACTES DÉTECTÉS SUR LA PAGE ---
+        if debug and pno < max_debug_pages:
+            st.write(f"**Cosmident — Page {pno+1}** : actes détectés ({len(page_rows)})")
+            if page_rows:
+                dfp = pd.DataFrame(page_rows)[["Patient", "Dent", "Code", "Acte_Cosmident", "Tarif_Cosmident"]]
+                st.dataframe(dfp, use_container_width=True, hide_index=True)
+            else:
+                st.info("Aucun acte détecté sur cette page.")
 
     df = pd.DataFrame(results)
     if not df.empty:
@@ -453,11 +463,6 @@ def build_cosmident_agg_by_patient(df_cos: pd.DataFrame, strategy: str) -> pd.Da
 
 # ==================== Fuzzy matching (par patient) ====================
 def fuzzy_best_match(dk: str, cos_list: list[str]) -> tuple[str | None, int]:
-    """
-    Retourne (meilleur_candidat, score) en combinant :
-    - RapidFuzz (token_set, token_sort, ratio, partial) si dispo
-    - token_similarity (par tokens) sinon
-    """
     best_key, best_score = None, 0
     if RF_AVAILABLE:
         scores = []
@@ -470,12 +475,10 @@ def fuzzy_best_match(dk: str, cos_list: list[str]) -> tuple[str | None, int]:
                 cand, sc, _ = m
                 scores.append((cand, sc))
         if scores:
-            # re-score le meilleur par tokens_similarity pour stabiliser sur fautes mineures
             cand, sc = max(scores, key=lambda x: x[1])
             ts = token_similarity(dk, cand)
             best_key, best_score = cand, max(sc, ts)
     else:
-        # difflib + tokens_similarity
         candidates = difflib.get_close_matches(dk, cos_list, n=3, cutoff=0.0)
         for cand in candidates or []:
             sc_dl = int(difflib.SequenceMatcher(None, dk, cand).ratio() * 100)
@@ -484,7 +487,6 @@ def fuzzy_best_match(dk: str, cos_list: list[str]) -> tuple[str | None, int]:
             if sc > best_score:
                 best_key, best_score = cand, sc
         if not candidates:
-            # tente pure tokens_similarity sur tout le pool
             for cand in cos_list:
                 sc = token_similarity(dk, cand)
                 if sc > best_score:
@@ -493,12 +495,18 @@ def fuzzy_best_match(dk: str, cos_list: list[str]) -> tuple[str | None, int]:
 
 def fuzzy_match_patients(des_keys, cos_keys, threshold=80, limit=3):
     mapping = {}
+    mapping_scores = {}  # nouveau: scores appliqués
     rows = []
     cos_list = list(cos_keys)
 
     for dk in des_keys:
         best_key, best_score = fuzzy_best_match(dk, cos_list)
-        mapping[dk] = best_key if (best_key and best_score >= threshold) else None
+        if best_key and best_score >= threshold:
+            mapping[dk] = best_key
+            mapping_scores[dk] = best_score
+        else:
+            mapping[dk] = None
+            mapping_scores[dk] = 0
 
         # meilleurs candidats pour UI
         if RF_AVAILABLE:
@@ -512,7 +520,7 @@ def fuzzy_match_patients(des_keys, cos_keys, threshold=80, limit=3):
                 rows.append({"Patient_norm_Desmos": dk, "Candidat_Cosmi": cand, "Score": sc})
 
     df_candidates = pd.DataFrame(rows).sort_values(["Patient_norm_Desmos", "Score"], ascending=[True, False])
-    return mapping, df_candidates
+    return mapping, mapping_scores, df_candidates
 
 # ==================== PIPELINE ====================
 if desmos_file and cosmi_pdf:
@@ -522,6 +530,7 @@ if desmos_file and cosmi_pdf:
         st.warning("Desmos n’a produit aucun acte.")
         st.stop()
 
+    # Filtres codes Desmos
     mask = pd.Series(True, index=df_des.index)
     codes = df_des["Code"].astype(str)
     if not keep_all_hbld:
@@ -538,30 +547,59 @@ if desmos_file and cosmi_pdf:
     cosmi_pdf_bytes = cosmi_pdf.read()
     df_cos = parse_cosmident_pdf(cosmi_pdf_bytes, exclude_hbld490=exclude_hbld490, exclude_hbld045=exclude_hbld045, duplicate_multi_dents=duplicate_multi_dents, debug=debug_pdf, max_debug_pages=max_debug_pages_pdf)
 
-    # --- Agrégation Cosmident (par patient uniquement) ---
+    # Panneau debug: résultats bruts Cosmident
+    if show_cosmident_rows:
+        st.subheader("Résultats Cosmident (bruts)")
+        if df_cos.empty:
+            st.info("Aucune ligne extraite du PDF Cosmident (PDF peut être scanné → penser OCR).")
+        else:
+            cols = ["Patient", "Patient_norm", "Dent", "Code", "Acte_Cosmident", "Tarif_Cosmident"]
+            st.dataframe(df_cos[cols], use_container_width=True, hide_index=True)
+
+    # --- Agrégation Cosmident par NOM PATIENT uniquement ---
     df_cos_agg = build_cosmident_agg_by_patient(df_cos, cosmident_strategy)
 
-    # --- Jointure exacte par Patient_norm ---
+    if show_cosmident_agg:
+        st.subheader("Agrégation Cosmident par patient (utilisée pour la jointure)")
+        if df_cos_agg.empty:
+            st.info("Aucune ligne agrégée (Cosmident vide).")
+        else:
+            cols = ["Patient_norm", "Acte_Cosmident", "Tarif_Cosmident", "Nb_actes_Cosmi"]
+            st.dataframe(df_cos_agg[cols], use_container_width=True, hide_index=True)
+
+    # --- Jointure stricte par Patient_norm (exacte) ---
     df_des["Patient_norm"] = df_des["Patient"].map(normalize_patient)
     df_merge = df_des.merge(df_cos_agg, on="Patient_norm", how="left")
     df_merge["Cosmident_match_exact"] = df_merge["Acte_Cosmident"].notna()
 
-    # --- Fuzzy (optionnel) ---
+    # --- Correspondance floue (optionnel) ---
     df_candidates = pd.DataFrame(columns=["Patient_norm_Desmos", "Candidat_Cosmi", "Score"])
+    df_mapping_show = pd.DataFrame()
     if use_fuzzy and not df_cos_agg.empty:
         des_keys = df_des["Patient_norm"].unique().tolist()
         cos_keys = df_cos_agg["Patient_norm"].unique().tolist()
-        mapping, df_candidates = fuzzy_match_patients(des_keys, cos_keys, threshold=fuzzy_threshold, limit=3)
+        mapping, mapping_scores, df_candidates = fuzzy_match_patients(des_keys, cos_keys, threshold=fuzzy_threshold, limit=3)
 
         # lignes sans match exact
         no_exact_mask = ~df_merge["Cosmident_match_exact"]
         df_no_exact = df_merge[no_exact_mask].copy()
 
-        # table de mappage
-        df_map = pd.DataFrame({"Patient_norm": list(mapping.keys()), "Cosmident_norm_mapped": [mapping[k] for k in mapping.keys()]})
-        df_no_exact = df_no_exact.merge(df_map, on="Patient_norm", how="left")
+        # table de mappage (avec score)
+        df_map = pd.DataFrame({
+            "Patient_norm": list(mapping.keys()),
+            "Cosmident_norm_mapped": [mapping[k] for k in mapping.keys()],
+            "Score_fuzzy": [mapping_scores[k] for k in mapping.keys()]
+        })
 
-        # garder celles pour lesquelles un candidat a été trouvé
+        # debug: mapping fuzzy appliqué
+        if show_fuzzy_mapping:
+            st.subheader("Mapping fuzzy appliqué (par patient)")
+            df_mapping_show = df_map.copy()
+            df_mapping_show["Appliqué"] = df_mapping_show["Cosmident_norm_mapped"].notna() & df_mapping_show["Score_fuzzy"].ge(fuzzy_threshold)
+            st.dataframe(df_mapping_show.sort_values(["Appliqué","Score_fuzzy"], ascending=[False, False]), use_container_width=True, hide_index=True)
+
+        # applique le mapping uniquement si un candidat existe
+        df_no_exact = df_no_exact.merge(df_map, on="Patient_norm", how="left")
         df_no_exact = df_no_exact[df_no_exact["Cosmident_norm_mapped"].notna()].copy()
 
         # merge avec Cosmident agrégé
@@ -577,7 +615,8 @@ if desmos_file and cosmi_pdf:
             df_no_exact[col] = df_no_exact[col].fillna(df_no_exact[f"{col}_fuzzy"])
 
         # réintégration
-        df_merge.loc[df_no_exact.index, ["Acte_Cosmident", "Tarif_Cosmident", "Nb_actes_Cosmi"]] = df_no_exact[["Acte_Cosmident", "Tarif_Cosmident", "Nb_actes_Cosmi"]].values
+        df_merge.loc[df_no_exact.index, ["Acte_Cosmident", "Tarif_Cosmident", "Nb_actes_Cosmi"]] = \
+            df_no_exact[["Acte_Cosmident", "Tarif_Cosmident", "Nb_actes_Cosmi"]].values
 
     # --- Indicateur final ---
     df_merge["Cosmident_match"] = df_merge["Acte_Cosmident"].notna()
@@ -593,7 +632,7 @@ if desmos_file and cosmi_pdf:
         df_merge = df_merge[mask].copy()
 
     # --- Affichage principal ---
-    affichage_cols = ["Patient", "Dent", "Code", "Acte", "Tarif", "Acte_Cosmident", "Tarif_Cosmident", "Nb_actes_Cosmi", "Cosmident_match"]
+    affichage_cols = ["Patient", "Patient_norm", "Dent", "Code", "Acte", "Tarif", "Acte_Cosmident", "Tarif_Cosmident", "Nb_actes_Cosmi", "Cosmident_match"]
     affichage_cols = [c for c in affichage_cols if c in df_merge.columns]
     st.success(f"**{len(df_merge)} actes rapprochés (jointure par NOM PATIENT)**")
     st.dataframe(df_merge[affichage_cols], use_container_width=True, hide_index=True)
