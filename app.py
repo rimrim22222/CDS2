@@ -6,36 +6,55 @@ from PIL import Image
 import pytesseract
 import io
 import unicodedata
+from pathlib import Path
 
+# ======================
+# CONFIG + LOGO
+# ======================
 st.set_page_config(page_title="Analyse Cosmident + Desmos", layout="wide")
-st.title("📄 Analyse des actes dentaires Cosmident + Desmos")
 
+logo_path = Path("logo.png")
+st.sidebar.title("🦷 Cosmident + Desmos")
+
+if logo_path.exists():
+    st.sidebar.image(str(logo_path), width=200)
+else:
+    st.sidebar.image(
+        "https://scontent-mrs2-1.xx.fbcdn.net/v/t39.30808-6/305157485_519313286862181_9045589531882558278_n.png",
+        width=200,
+    )
+    st.sidebar.caption("Logo manquant → place logo.png à la racine de l’app")
+
+st.title("📄 Analyse des actes dentaires Cosmident + Desmos (Excel)")
+
+# ======================
+# UPLOAD
+# ======================
 uploaded_cosmident = st.file_uploader(
-    "Upload le fichier Cosmident (PDF ou image)", type=["pdf", "png", "jpg", "jpeg"]
+    "📤 Charge le fichier Cosmident (PDF ou image)", type=["pdf", "png", "jpg", "jpeg"]
 )
 uploaded_desmos = st.file_uploader(
-    "Upload le fichier Desmos (PDF)", type=["pdf"], key="desmos"
+    "📤 Charge le fichier Desmos (Excel)", type=["xls", "xlsx"], key="desmos"
 )
 
-# ============================
-# 🔧 UTILITAIRES
-# ============================
+# ======================
+# OUTILS
+# ======================
 
 def normalize_name(name: str):
-    """Normalise fortement un nom pour comparaison : minuscules, sans accents, sans espaces, sans ponctuation."""
+    """Normalise fortement un nom : minuscules, sans accents, alphanum uniquement."""
     if not isinstance(name, str):
         return ""
     name = name.lower()
-    name = ''.join(
-        c for c in unicodedata.normalize('NFD', name)
-        if unicodedata.category(c) != 'Mn'
+    name = "".join(
+        c for c in unicodedata.normalize("NFD", name)
+        if unicodedata.category(c) != "Mn"
     )
     name = re.sub(r"[^a-z]", "", name)
     return name
 
 
 def levenshtein(a, b):
-    """Distance de Levenshtein classique."""
     if len(a) < len(b):
         return levenshtein(b, a)
 
@@ -51,39 +70,34 @@ def levenshtein(a, b):
             substitutions = previous_row[j] + (ca != cb)
             current_row.append(min(insertions, deletions, substitutions))
         previous_row = current_row
-
     return previous_row[-1]
 
 
 def similarity(a, b):
-    """Score de similarité entre 0 et 1 basé sur Levenshtein."""
+    """Score 0–1 basé sur Levenshtein."""
     if not a or not b:
         return 0
     a = normalize_name(a)
     b = normalize_name(b)
+    if not a or not b:
+        return 0
     dist = levenshtein(a, b)
     max_len = max(len(a), len(b))
-    if max_len == 0:
-        return 0
     return 1 - dist / max_len
 
 
-# ============================
-# 🔹 Extraction image Cosmident
-# ============================
+# ======================
+# EXTRACTION COSMIDENT
+# ======================
 
 def extract_text_from_image(image):
     return pytesseract.image_to_string(image)
 
 
-# ============================
-# 🔹 Extraction Cosmident
-# ============================
-
 def extract_data_from_cosmident(file):
     file_bytes = file.read()
 
-    # --- PDF
+    # PDF
     if file.type == "application/pdf":
         doc = fitz.open(stream=file_bytes, filetype="pdf")
         text = ""
@@ -92,14 +106,12 @@ def extract_data_from_cosmident(file):
             stop_pattern = r"(COSMIDENT|IBAN|Siret|BIC|Tél\.|TOTAL TTC|Règlement|Chèque)"
             page_text = re.split(stop_pattern, page_text, flags=re.IGNORECASE)[0]
             text += page_text + "\n"
-
-    # --- IMAGE
     else:
+        # IMAGE
         image = Image.open(io.BytesIO(file_bytes))
         text = extract_text_from_image(image)
 
-    # Option Debug
-    with st.expander("Texte brut Cosmident"):
+    with st.expander("🔎 Texte Cosmident (debug)"):
         st.write(text[:2000])
 
     lines = [l.strip() for l in text.split("\n") if l.strip()]
@@ -109,12 +121,11 @@ def extract_data_from_cosmident(file):
     current_act = ""
     current_prices = []
 
-    for i, line in enumerate(lines):
+    for line in lines:
 
-        # Détection patient
+        # Patient
         m = re.search(r"Ref\.?\s*(?:Patient\s*)?:?\s*([\w\s\'\-]+)", line, re.I)
         if m:
-            # Sauvegarder acte précédent
             if current_patient and current_act and current_prices:
                 results.append({
                     "Patient": current_patient,
@@ -129,7 +140,6 @@ def extract_data_from_cosmident(file):
         if not current_patient:
             continue
 
-        # Extraction Montants
         prices = re.findall(r"\d+[\.,]\d{2}", line)
         prices = [p.replace(",", ".") for p in prices]
 
@@ -144,7 +154,6 @@ def extract_data_from_cosmident(file):
                 })
                 current_act = ""
                 current_prices = []
-
             current_act += " " + text_without_prices
 
         if prices:
@@ -160,61 +169,41 @@ def extract_data_from_cosmident(file):
     return pd.DataFrame(results)
 
 
-# ============================
-# 🔹 Extraction Desmos
-# ============================
+# ======================
+# EXTRACTION DESMOS EXCEL
+# ======================
 
-def extract_desmos_acts(file):
-    doc = fitz.open(stream=file.read(), filetype="pdf")
-    text = "\n".join([page.get_text() for page in doc])
+def extract_desmos_acts_excel(file):
+    try:
+        df = pd.read_excel(file)
+    except Exception as e:
+        st.error(f"❌ Erreur lecture Excel Desmos : {e}")
+        return pd.DataFrame()
 
-    lines = text.split("\n")
-    results = []
-    current_patient = None
-    current_act = None
-    current_price = None
+    df.columns = [c.strip().lower() for c in df.columns]
 
-    for line in lines:
-        # Détection patient
-        m = re.search(r"Ref\. ([A-Za-zÀ-ÿ\s\'\-]+)", line)
-        if m:
-            if current_patient and current_act and current_price:
-                results.append({
-                    "Patient": current_patient,
-                    "Acte Desmos": current_act,
-                    "Prix Desmos": current_price
-                })
-            current_patient = m.group(1).strip()
-            current_act = ""
-            current_price = ""
-            continue
+    col_patient = next((c for c in df.columns if "patient" in c), None)
+    col_acte = next((c for c in df.columns if "acte" in c), None)
+    col_prix = next((c for c in df.columns if "prix" in c or "hono" in c), None)
 
-        # Détection acte
-        if re.search(r"(Couronne|BIOTECH|ZIRCONE|ONLAY|EMAX|ADJONCTION|GOUTTIÈRE|RESINE|HBL\w+)", line, re.I):
-            current_act = line.strip()
+    if not (col_patient and col_acte and col_prix):
+        st.error("❌ Le fichier Desmos doit contenir : Patient / Acte / Prix")
+        return pd.DataFrame()
 
-        # Détection prix
-        m_price = re.search(r"(\d+[\.,]\d{2})", line)
-        if m_price:
-            current_price = m_price.group(1).replace(",", ".")
+    df[col_prix] = df[col_prix].astype(str).str.replace(",", ".")
+    df[col_prix] = df[col_prix].str.extract(r"(\d+[\.,]?\d*)")[0]
 
-    if current_patient and current_act and current_price:
-        results.append({
-            "Patient": current_patient,
-            "Acte Desmos": current_act,
-            "Prix Desmos": current_price
-        })
+    df = df[[col_patient, col_acte, col_prix]].copy()
+    df.columns = ["Patient", "Acte Desmos", "Prix Desmos"]
 
-    return pd.DataFrame(results)
+    return df
 
 
-# ============================
-# 🔥 MATCHING PERMISSIF
-# ============================
+# ======================
+# MATCH PERMISSIF
+# ======================
 
 def best_match(target_name, df_desmos):
-    """Trouve le meilleur match DESMOS basé sur une similarité permissive."""
-
     best_score = 0
     best_row = None
 
@@ -224,7 +213,7 @@ def best_match(target_name, df_desmos):
             best_score = score
             best_row = row
 
-    if best_score < 0.40:  # Trop faible → pas de correspondance
+    if best_score < 0.40:
         return "", "", "", 0
 
     return (
@@ -235,28 +224,24 @@ def best_match(target_name, df_desmos):
     )
 
 
-# ============================
-# 🔹 Interface
-# ============================
+# ======================
+# INTERFACE
+# ======================
 
 if uploaded_cosmident and uploaded_desmos:
 
     uploaded_cosmident.seek(0)
-    uploaded_desmos.seek(0)
 
     df_cosmo = extract_data_from_cosmident(uploaded_cosmident)
-    df_desmos = extract_desmos_acts(uploaded_desmos)
+    df_desmos = extract_desmos_acts_excel(uploaded_desmos)
 
     st.subheader("📌 Table Cosmident")
     st.dataframe(df_cosmo, use_container_width=True)
 
-    st.subheader("📌 Table Desmos")
+    st.subheader("📌 Table Desmos (Excel)")
     st.dataframe(df_desmos, use_container_width=True)
 
-    # ======================
-    # 🚀 Fusion avec matching permissif
-    # ======================
-
+    # Fusion
     merged = df_cosmo.copy()
     merged["Patient Desmos"] = ""
     merged["Acte Desmos"] = ""
@@ -264,10 +249,10 @@ if uploaded_cosmident and uploaded_desmos:
     merged["Score Similarité"] = 0.0
 
     for i, pat in enumerate(merged["Patient"]):
-        pat_desmos, act, price, score = best_match(pat, df_desmos)
-        merged.at[i, "Patient Desmos"] = pat_desmos
-        merged.at[i, "Acte Desmos"] = act
-        merged.at[i, "Prix Desmos"] = price
+        pdes, acte, prix, score = best_match(pat, df_desmos)
+        merged.at[i, "Patient Desmos"] = pdes
+        merged.at[i, "Acte Desmos"] = acte
+        merged.at[i, "Prix Desmos"] = prix
         merged.at[i, "Score Similarité"] = score
 
     st.subheader("🧩 Résultat Final (Fusion Permissive)")
