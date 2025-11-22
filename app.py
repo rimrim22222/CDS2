@@ -56,7 +56,7 @@ with st.sidebar:
     duplicate_multi_dents = st.checkbox("Dupliquer l'acte pour chaque dent détectée", value=False)
 
     st.markdown("---")
-    st.caption("Agrégation Cosmident par patient (si plusieurs actes)")
+    st.caption("Agrégation Cosmident (si plusieurs actes par patient)")
     cosmident_strategy = st.selectbox("Stratégie", ["Premier acte", "Concat actes", "Somme des tarifs"], index=0)
 
     st.markdown("---")
@@ -110,85 +110,113 @@ def to_float_eu(x):
     except Exception:
         return 0.0
 
-# ==================== EXPORT EXCEL (XLSXWRITER, sans openpyxl) ====================
-def style_dataframe_to_excel(df: pd.DataFrame, money_columns=None, sheet_name="Actes") -> BytesIO:
+# ==================== EXPORT EXCEL (AUTO-DÉTECTION DU MOTEUR) ====================
+def _pick_excel_engine():
+    """Retourne le premier moteur Excel disponible, sinon None."""
+    try:
+        import xlsxwriter  # noqa: F401
+        return "xlsxwriter"
+    except Exception:
+        pass
+    try:
+        import openpyxl  # noqa: F401
+        return "openpyxl"
+    except Exception:
+        pass
+    return None
+
+def style_dataframe_to_excel(df: pd.DataFrame, money_columns=None, sheet_name="Actes") -> BytesIO | None:
     """
-    Exporte un DataFrame en .xlsx avec le moteur xlsxwriter.
-    - En-têtes : fond bleu, texte blanc, gras
-    - Auto-width par colonne
-    - Auto-filter
-    - Format monétaire (€) sur colonnes indiquées
+    Exporte un DataFrame en .xlsx :
+    - Si xlsxwriter dispo : en-têtes stylées + format €
+    - Si openpyxl seul : export sans style (mais Excel généré)
+    - Si aucun moteur : retourne None (pas de bouton Excel)
     """
+    engine = _pick_excel_engine()
+    if engine is None:
+        return None
+
     output = BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+    with pd.ExcelWriter(output, engine=engine) as writer:
         df.to_excel(writer, index=False, sheet_name=sheet_name)
-        workbook  = writer.book
-        worksheet = writer.sheets[sheet_name]
 
-        header_fmt = workbook.add_format({
-            "bold": True, "font_color": "white",
-            "bg_color": "#1F4E79", "align": "center", "valign": "vcenter"
-        })
-        money_fmt = workbook.add_format({"num_format": u'€ #,##0.00'})
+        if engine == "xlsxwriter":
+            workbook  = writer.book
+            worksheet = writer.sheets[sheet_name]
 
-        # En-têtes stylées
-        for col_idx, col_name in enumerate(df.columns):
-            worksheet.write(0, col_idx, col_name, header_fmt)
+            # Styles en-têtes
+            header_fmt = workbook.add_format({
+                "bold": True, "font_color": "white",
+                "bg_color": "#1F4E79", "align": "center", "valign": "vcenter"
+            })
+            money_fmt = workbook.add_format({"num_format": u'€ #,##0.00'})
 
-        # Auto-filter sur la plage du tableau
-        worksheet.autofilter(0, 0, len(df), len(df.columns) - 1)
+            # Applique style aux en-têtes
+            for col_idx, col_name in enumerate(df.columns):
+                worksheet.write(0, col_idx, col_name, header_fmt)
 
-        # Auto-width par colonne
-        for col_idx, col_name in enumerate(df.columns):
-            max_len = max(
-                [len(str(col_name))] + [len(str(v)) if v is not None else 0 for v in df[col_name].tolist()]
-            )
-            worksheet.set_column(col_idx, col_idx, min(max_len + 2, 60))
+            # Auto-filter
+            worksheet.autofilter(0, 0, len(df), len(df.columns) - 1)
 
-        # Format € sur colonnes ciblées
-        if money_columns:
-            for col_name in money_columns:
-                if col_name in df.columns:
-                    col_idx = df.columns.get_loc(col_name)
-                    worksheet.set_column(col_idx, col_idx, None, money_fmt)
+            # Auto-width
+            for col_idx, col_name in enumerate(df.columns):
+                max_len = max(
+                    [len(str(col_name))] + [len(str(v)) if v is not None else 0 for v in df[col_name].tolist()]
+                )
+                worksheet.set_column(col_idx, col_idx, min(max_len + 2, 60))
+
+            # Format €
+            if money_columns:
+                for col_name in money_columns:
+                    if col_name in df.columns:
+                        col_idx = df.columns.get_loc(col_name)
+                        worksheet.set_column(col_idx, col_idx, None, money_fmt)
 
     output.seek(0)
     return output
 
-def style_summary_to_excel(df_sum: pd.DataFrame, sheet_name="Récap") -> BytesIO:
+def style_summary_to_excel(df_sum: pd.DataFrame, sheet_name="Récap") -> BytesIO | None:
     """
-    Exporte un récap en .xlsx (xlsxwriter) avec style d’en-tête, auto-width, auto-filter
-    et format € sur la colonne 'Total (€)' si présente.
+    Export récap en .xlsx :
+    - xlsxwriter : en-têtes stylées + format € sur 'Total (€)' si présent
+    - openpyxl : export sans style
+    - aucun moteur : None
     """
+    engine = _pick_excel_engine()
+    if engine is None:
+        return None
+
     output = BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+    with pd.ExcelWriter(output, engine=engine) as writer:
         df_sum.to_excel(writer, index=False, sheet_name=sheet_name)
-        workbook  = writer.book
-        worksheet = writer.sheets[sheet_name]
 
-        header_fmt = workbook.add_format({
-            "bold": True, "font_color": "white",
-            "bg_color": "#2F528F", "align": "center", "valign": "vcenter"
-        })
-        money_fmt = workbook.add_format({"num_format": u'€ #,##0.00'})
+        if engine == "xlsxwriter":
+            workbook  = writer.book
+            worksheet = writer.sheets[sheet_name]
 
-        # En-têtes
-        for col_idx, col_name in enumerate(df_sum.columns):
-            worksheet.write(0, col_idx, col_name, header_fmt)
+            header_fmt = workbook.add_format({
+                "bold": True, "font_color": "white",
+                "bg_color": "#2F528F", "align": "center", "valign": "vcenter"
+            })
+            money_fmt = workbook.add_format({"num_format": u'€ #,##0.00'})
 
-        worksheet.autofilter(0, 0, len(df_sum), len(df_sum.columns) - 1)
+            # En-têtes stylées
+            for col_idx, col_name in enumerate(df_sum.columns):
+                worksheet.write(0, col_idx, col_name, header_fmt)
 
-        # Auto-width
-        for col_idx, col_name in enumerate(df_sum.columns):
-            max_len = max(
-                [len(str(col_name))] + [len(str(v)) if v is not None else 0 for v in df_sum[col_name].tolist()]
-            )
-            worksheet.set_column(col_idx, col_idx, min(max_len + 2, 50))
+            worksheet.autofilter(0, 0, len(df_sum), len(df_sum.columns) - 1)
 
-        # Format € sur 'Total (€)'
-        if "Total (€)" in df_sum.columns:
-            col_idx = df_sum.columns.get_loc("Total (€)")
-            worksheet.set_column(col_idx, col_idx, None, money_fmt)
+            # Auto-width
+            for col_idx, col_name in enumerate(df_sum.columns):
+                max_len = max(
+                    [len(str(col_name))] + [len(str(v)) if v is not None else 0 for v in df_sum[col_name].tolist()]
+                )
+                worksheet.set_column(col_idx, col_idx, min(max_len + 2, 50))
+
+            # Format € sur 'Total (€)'
+            if "Total (€)" in df_sum.columns:
+                col_idx = df_sum.columns.get_loc("Total (€)")
+                worksheet.set_column(col_idx, col_idx, None, money_fmt)
 
     output.seek(0)
     return output
@@ -608,13 +636,17 @@ if desmos_file and cosmi_pdf:
         st.caption("Token-sort ratio (RapidFuzz si disponible, sinon approximation via difflib).")
         st.dataframe(df_scores, use_container_width=True, hide_index=True)
 
-    # --- Exports ---
+    # --- Export CSV ---
     csv = df_merge[affichage_cols].to_csv(index=False, sep=";", encoding="utf-8-sig")
     st.download_button("Télécharger le CSV", data=csv, file_name="Protheses_Desmos_Cosmident_byPatient.csv", mime="text/csv")
 
+    # --- Export Excel (avec fallback moteur) ---
     xls = style_dataframe_to_excel(df_merge[affichage_cols], money_columns=["Tarif", "Tarif_Cosmident"], sheet_name="Actes rapprochés (par patient)")
-    st.download_button("Télécharger l'Excel (.xlsx)", data=xls, file_name="Protheses_Desmos_Cosmident_byPatient.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    if xls is not None:
+        st.download_button("Télécharger l'Excel (.xlsx)", data=xls, file_name="Protheses_Desmos_Cosmident_byPatient.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    else:
+        st.info("Aucun moteur Excel installé (xlsxwriter/openpyxl). Le téléchargement **CSV** reste disponible.")
 
     # --- Récap par patient (Desmos) ---
     df_merge["Tarif_float"] = df_merge["Tarif"].apply(to_float_eu)
@@ -629,8 +661,11 @@ if desmos_file and cosmi_pdf:
     st.dataframe(recap, use_container_width=True, hide_index=True)
 
     xls_sum = style_summary_to_excel(recap, sheet_name="Récap par patient")
-    st.download_button("Télécharger le récap (.xlsx)", data=xls_sum, file_name="Recap_Desmos_byPatient.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    if xls_sum is not None:
+        st.download_button("Télécharger le récap (.xlsx)", data=xls_sum, file_name="Recap_Desmos_byPatient.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    else:
+        st.info("Aucun moteur Excel installé — récap disponible en CSV si nécessaire.")
 
 else:
     st.info("Charge **l’Excel Desmos** et **le PDF Cosmident** pour lancer l’extraction.")
