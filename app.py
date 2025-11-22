@@ -243,7 +243,7 @@ if uploaded_facturation:
             continue
 
         # Ignorer certains codes
-        if code in ("HBLD490", "HBLD045"):
+        if code in ("HBLD490", "HBLD045","HBLD724"):
             continue
 
         # Tarif
