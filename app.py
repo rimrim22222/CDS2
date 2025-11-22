@@ -159,12 +159,8 @@ def best_match_row(target_name: str, index: dict, score_threshold: float):
             best_score = score
     return best if best_score >= score_threshold else None
 
-# ---------- NEW: toutes les correspondances ----------
+# NEW: récupérer TOUTES les correspondances (pas seulement la meilleure)
 def find_all_matches(target_name: str, index: dict, score_threshold: float) -> list[dict]:
-    """
-    Retourne toutes les lignes correspondant au patient 'target_name'
-    selon le score permissif (>= score_threshold).
-    """
     target_key = " ".join(canonical_tokens(target_name))
     if not target_key or not index:
         return []
@@ -172,9 +168,11 @@ def find_all_matches(target_name: str, index: dict, score_threshold: float) -> l
     for cand_key, rows in index.items():
         match, score = names_match_permissive(target_key, cand_key)
         if match and score >= score_threshold:
-            matches.extend(rows)
+            matches.extend(rows)  # toutes les lignes pour cette clé
+    # dédoublonnage défensif par conversion en dict immuable (selon colonnes Dispos)
     if matches:
-        df_tmp = pd.DataFrame(matches).drop_duplicates()
+        df_tmp = pd.DataFrame(matches)
+        df_tmp = df_tmp.drop_duplicates()
         return df_tmp.to_dict(orient="records")
     return []
 
@@ -202,16 +200,19 @@ if uploaded_facturation:
         values = [str(v).strip() for v in row.tolist()]
         row_text = " ".join([v for v in values if v and v not in ["nan", "None", ""]])
 
+        # Réinitialisation sur bloc doublon Factures/Avoirs
         if re.search(r"Factures et Avoirs CENTRE DE SANTÉ DES LAURIERS", row_text, re.I):
             current_patient = None
             continue
 
+        # Détection patient
         if re.search(r"N°\s*Dossier", row_text, re.I):
             m = re.search(r"([A-ZÉÈÊËÀÂÄÔÖÙÛÜÇ][A-ZÉÈÊËÀÂÄÔÖÙÛÜÇ'\- ]{4,80})\s+N°\s*Dossier", row_text, re.I)
             if m:
                 current_patient = m.group(1).strip()
             continue
 
+        # En-têtes à ignorer
         header_patterns = [
             r"^DATE[\s:]", r"^N°\s*FACT", r"^DENT\(S\)", r"^ACTE$", r"^HONO", r"^AMO$",
             r"^TOTAL DES FACTURES", r"^IMPRIMÉ LE"
@@ -219,6 +220,7 @@ if uploaded_facturation:
         if any(re.search(p, row_text.upper()) for p in header_patterns):
             continue
 
+        # Recherche du code cible
         code = None
         code_idx = -1
         for i, cell in enumerate(values):
@@ -227,11 +229,15 @@ if uploaded_facturation:
                 code = cell
                 code_idx = i
                 break
+
         if not code:
             continue
+
+        # Ignorer certains codes
         if code in ("HBLD490", "HBLD045"):
             continue
 
+        # Tarif
         tarif = "?"
         for offset in [1, 2]:
             if code_idx + offset < len(values):
@@ -240,6 +246,7 @@ if uploaded_facturation:
                     tarif = val.replace(".", ",")
                     break
 
+        # Dent
         dent = "?"
         for i in range(code_idx - 1, max(-1, code_idx - 20), -1):
             m = re.search(r"\b([1-4]?\d)\b", str(values[i]))
@@ -247,6 +254,7 @@ if uploaded_facturation:
                 dent = m.group(1).zfill(2)
                 break
 
+        # Description acte
         acte = "?"
         for i in range(code_idx - 1, max(-1, code_idx - 30), -1):
             v = str(values[i]).strip()
@@ -265,13 +273,19 @@ if uploaded_facturation:
             "Tarif": tarif
         })
 
+    # AFFICHAGE RÉSULTATS
     if results:
         df_result = pd.DataFrame(results)[["Patient", "Dent", "Code", "Acte", "Tarif"]]
         st.success(f"**{len(df_result)} actes prothétiques extraits !**")
         st.dataframe(df_result, use_container_width=True, hide_index=True)
+
         csv = df_result.to_csv(index=False, sep=";", encoding="utf-8-sig")
-        st.download_button("⬇️ Télécharger le Résultat (CSV)", data=csv,
-                           file_name="Protheses_HBLD_HBMD351_HBLD634.csv", mime="text/csv")
+        st.download_button(
+            label="⬇️ Télécharger le Résultat (CSV)",
+            data=csv,
+            file_name="Protheses_HBLD_HBMD351_HBLD634.csv",
+            mime="text/csv"
+        )
     else:
         st.warning("Aucun acte prothétique trouvé.")
 else:
@@ -288,6 +302,7 @@ with col_b:
 with col_c:
     uploaded_desmos = st.file_uploader("📥 Desmos (Excel)", type=["xls", "xlsx"])
 
+# --- Extraction Cosmident (PDF) ---
 def extract_data_from_cosmident(file):
     file_bytes = file.read()
     full_text = ""
@@ -388,6 +403,7 @@ def extract_data_from_cosmident(file):
         df = df.drop_duplicates(subset=["Patient", "Acte Cosmident", "Prix Cosmident"])
     return df
 
+# --- Lecture Desmos (Excel) ---
 def read_desmos_excel(file) -> pd.DataFrame:
     try:
         df = pd.read_excel(
@@ -459,7 +475,9 @@ if uploaded_desmos:
 
 st.divider()
 
-# ==================== 3) INDICES DE MATCH ====================
+# ==================== 3) MATCHING + STATUTS EXPLICITES ====================
+st.subheader("3) Matching par Patient (Résultat vs Cosmident/Desmos)")
+
 if df_result.empty:
     st.info("⚠️ Le tableau Résultat n’est pas encore disponible. Charge l’Excel de facturation au §1.")
     st.stop()
@@ -468,8 +486,51 @@ index_res = make_index(df_result, "Patient")
 index_des = make_index(df_des, "Patient") if not df_des.empty else {}
 index_cos = make_index(df_cos, "Patient") if not df_cos.empty else {}
 
+df_out = df_result.copy()
+df_out["Match Desmos"] = False
+df_out["Acte Desmos"] = ""
+df_out["Prix Desmos"] = ""
+df_out["Statut Desmos"] = ""  # "match" ou "aucun match Desmos"
+
+df_out["Match Cosmident"] = False
+df_out["Acte Cosmident"] = ""
+df_out["Prix Cosmident"] = ""
+df_out["Statut Cosmident"] = ""  # "match" ou "aucun match Cosmident"
+
+df_out["Statut Global"] = ""  # 🟩 / 🟦 / 🟥
+
+for i, row in df_out.iterrows():
+    pname = str(row["Patient"])
+
+    r_des = best_match_row(pname, index_des, SCORE_THRESHOLD)
+    if r_des is not None:
+        df_out.at[i, "Match Desmos"] = True
+        df_out.at[i, "Acte Desmos"] = str(r_des.get("Acte Desmos", ""))
+        df_out.at[i, "Prix Desmos"] = str(r_des.get("Prix Desmos", ""))
+        df_out.at[i, "Statut Desmos"] = "match"
+    else:
+        df_out.at[i, "Statut Desmos"] = "aucun match Desmos"
+
+    r_cos = best_match_row(pname, index_cos, SCORE_THRESHOLD)
+    if r_cos is not None:
+        df_out.at[i, "Match Cosmident"] = True
+        df_out.at[i, "Acte Cosmident"] = str(r_cos.get("Acte Cosmident", ""))
+        df_out.at[i, "Prix Cosmident"] = str(r_cos.get("Prix Cosmident", ""))
+        df_out.at[i, "Statut Cosmident"] = "match"
+    else:
+        df_out.at[i, "Statut Cosmident"] = "aucun match Cosmident"
+
+    both = df_out.at[i, "Match Desmos"] and df_out.at[i, "Match Cosmident"]
+    only_one = df_out.at[i, "Match Desmos"] ^ df_out.at[i, "Match Cosmident"]
+    if both:
+        df_out.at[i, "Statut Global"] = "🟩 match Desmos + Cosmident"
+    elif only_one:
+        df_out.at[i, "Statut Global"] = "🟦 match d’un seul"
+    else:
+        df_out.at[i, "Statut Global"] = "🟥 aucun match"
+
 # ==================== 3bis) PRÉFIXE : ORPHELINS COSMIDENT (en orange) ====================
-cos_orphans_rows = []
+cos_orphans = []
 if not df_cos.empty:
     for _, r in df_cos.iterrows():
         pname_cos = str(r["Patient"])
@@ -480,104 +541,44 @@ if not df_cos.empty:
             m_des = best_match_row(pname_cos, index_des, SCORE_THRESHOLD)
             is_orphan = (m_res is None and m_des is None)
         if is_orphan:
-            prix_src = str(r.get("Prix Cosmident", "")).replace(",", ".")
-            cos_orphans_rows.append({
+            cos_orphans.append({
                 "Patient": pname_cos,
-                "Source": "Cosmident (orphelin)",
-                "Dent (Résultat)": "",
-                "Code (Résultat)": "",
-                "Acte (Résultat)": "",
-                "Tarif (Résultat)": "",
-                "Acte (Source)": str(r.get("Acte Cosmident", "")),
-                "Prix (Source)": str(r.get("Prix Cosmident", "")),
-                "Prix_num": pd.to_numeric(prix_src, errors="coerce"),
+                "Dent": "",
+                "Code": "",
+                "Acte": "",
+                "Tarif": "",
+                "Match Desmos": False,
+                "Acte Desmos": "",
+                "Prix Desmos": "",
+                "Match Cosmident": True,
+                "Acte Cosmident": str(r.get("Acte Cosmident", "")),
+                "Prix Cosmident": str(r.get("Prix Cosmident", "")),
                 "Statut Desmos": "aucun match Desmos",
                 "Statut Cosmident": "orphan Cosmident",
-                "Statut Global": "🟧 Cosmident sans correspondance",
+                "Statut Global": "🟧 Cosmident sans correspondance"
             })
 
-# ==================== 4) TABLEAU COMPARÉ & COLORÉ (TOUTES LES CORRESPONDANCES, TRI PAR PRIX) ====================
-st.subheader("4) Tableau comparé et coloré — toutes les correspondances (triées par prix croissant)")
+df_final = pd.concat([pd.DataFrame(cos_orphans), df_out], ignore_index=True)
+st.success(f"✅ Matching terminé — {len(df_final)} lignes (dont {len(cos_orphans)} orphelins Cosmident en tête)")
 
-rows_main = []
-for _, base in df_result.iterrows():
-    p = str(base["Patient"])
-    des_list = find_all_matches(p, index_des, SCORE_THRESHOLD)
-    cos_list = find_all_matches(p, index_cos, SCORE_THRESHOLD)
-    has_des = len(des_list) > 0
-    has_cos = len(cos_list) > 0
-
-    statut_global = "🟥 aucun match"
-    if has_des and has_cos:
-        statut_global = "🟩 match Desmos + Cosmident"
-    elif has_des ^ has_cos:
-        statut_global = "🟦 match d’un seul"
-
-    # Cosmident: une ligne par acte trouvé
-    for r in cos_list:
-        prix_src = str(r.get("Prix Cosmident", "")).replace(",", ".")
-        rows_main.append({
-            "Patient": p,
-            "Source": "Cosmident",
-            "Dent (Résultat)": str(base.get("Dent", "")),
-            "Code (Résultat)": str(base.get("Code", "")),
-            "Acte (Résultat)": str(base.get("Acte", "")),
-            "Tarif (Résultat)": str(base.get("Tarif", "")),
-            "Acte (Source)": str(r.get("Acte Cosmident", "")),
-            "Prix (Source)": str(r.get("Prix Cosmident", "")),
-            "Prix_num": pd.to_numeric(prix_src, errors="coerce"),
-            "Statut Desmos": ("match" if has_des else "aucun match Desmos"),
-            "Statut Cosmident": "match",
-            "Statut Global": statut_global,
-        })
-
-    # Desmos: une ligne par acte trouvé
-    for r in des_list:
-        prix_src = str(r.get("Prix Desmos", "")).replace(",", ".")
-        rows_main.append({
-            "Patient": p,
-            "Source": "Desmos",
-            "Dent (Résultat)": str(base.get("Dent", "")),
-            "Code (Résultat)": str(base.get("Code", "")),
-            "Acte (Résultat)": str(base.get("Acte", "")),
-            "Tarif (Résultat)": str(base.get("Tarif", "")),
-            "Acte (Source)": str(r.get("Acte Desmos", "")),
-            "Prix (Source)": str(r.get("Prix Desmos", "")),
-            "Prix_num": pd.to_numeric(prix_src, errors="coerce"),
-            "Statut Desmos": "match",
-            "Statut Cosmident": ("match" if has_cos else "aucun match Cosmident"),
-            "Statut Global": statut_global,
-        })
-
-# Concaténer: orphelins en tête + correspondances étendues
-df_main = pd.DataFrame(rows_main)
-if not df_main.empty:
-    df_main = df_main.sort_values(by=["Patient", "Prix_num", "Source"], ascending=[True, True, True])
-df_final = pd.concat([pd.DataFrame(cos_orphans_rows), df_main], ignore_index=True)
-
-st.success(f"✅ Affichage terminé — {len(df_final)} lignes (incluant {len(cos_orphans_rows)} orphelins Cosmident en tête)")
-
-# ==================== COULEURS ====================
+# ==================== 4) MISE EN COULEUR ====================
 def color_row(row):
-    val = str(row.get("Statut Global", ""))
+    val = str(row["Statut Global"])
     if val.startswith("🟩"):
         base = "background-color: #c6f6d5;"  # vert clair
     elif val.startswith("🟦"):
         base = "background-color: #cfe8ff;"  # bleu clair
     elif val.startswith("🟧"):
-        base = "background-color: #ffe5b4;"  # orange pâle (orphelins)
+        base = "background-color: #ffe5b4;"  # orange pâle
     else:
         base = "background-color: #ffd6d6;"  # rouge clair
-
     styles = [base] * len(row)
-
     if "aucun match Desmos" in str(row.get("Statut Desmos", "")):
         try:
             col_idx = df_final.columns.get_loc("Statut Desmos")
             styles[col_idx] = "background-color: #fff3cd;"  # jaune pâle
         except Exception:
             pass
-
     stat_cos = str(row.get("Statut Cosmident", ""))
     if ("aucun match Cosmident" in stat_cos) or ("orphan Cosmident" in stat_cos):
         try:
@@ -585,13 +586,73 @@ def color_row(row):
             styles[col_idx] = "background-color: #ffe5b4;"  # orange pâle
         except Exception:
             pass
-
     return styles
 
 styled = df_final.style.apply(color_row, axis=1)
-st.dataframe(styled.drop(columns=["Prix_num"]), use_container_width=True, hide_index=True)
 
-# ==================== FILTRES RAPIDES (optionnels) ====================
+st.subheader("4) Tableau comparé et coloré")
+st.caption("🟩 match Desmos + Cosmident | 🟦 match d’un seul | 🟥 aucun match | 🟧 Cosmident sans correspondance (en tête)")
+st.dataframe(styled, use_container_width=True, hide_index=True)
+
+# ==================== 4bis) VUE DÉTAILLÉE : TOUTES LES LIGNES TRIÉES PAR TARIF ====================
+st.subheader("4bis) Vue détaillée des correspondances (toutes les lignes, triées par tarif croissant)")
+rows_all = []
+if not df_result.empty:
+    for _, base in df_result.iterrows():
+        p = str(base["Patient"])
+        des_list = find_all_matches(p, index_des, SCORE_THRESHOLD)
+        cos_list = find_all_matches(p, index_cos, SCORE_THRESHOLD)
+
+        # Créer une ligne par correspondance Desmos
+        for r in des_list:
+            prix = str(r.get("Prix Desmos", "")).replace(",", ".")
+            rows_all.append({
+                "Patient": p,
+                "Source": "Desmos",
+                "Dent (Résultat)": str(base.get("Dent", "")),
+                "Code (Résultat)": str(base.get("Code", "")),
+                "Acte (Résultat)": str(base.get("Acte", "")),
+                "Tarif (Résultat)": str(base.get("Tarif", "")),
+                "Acte (Source)": str(r.get("Acte Desmos", "")),
+                "Prix (Source)": str(r.get("Prix Desmos", "")),
+                "Prix_num": pd.to_numeric(prix, errors="coerce"),
+            })
+
+        # Créer une ligne par correspondance Cosmident
+        for r in cos_list:
+            prix = str(r.get("Prix Cosmident", "")).replace(",", ".")
+            rows_all.append({
+                "Patient": p,
+                "Source": "Cosmident",
+                "Dent (Résultat)": str(base.get("Dent", "")),
+                "Code (Résultat)": str(base.get("Code", "")),
+                "Acte (Résultat)": str(base.get("Acte", "")),
+                "Tarif (Résultat)": str(base.get("Tarif", "")),
+                "Acte (Source)": str(r.get("Acte Cosmident", "")),
+                "Prix (Source)": str(r.get("Prix Cosmident", "")),
+                "Prix_num": pd.to_numeric(prix, errors="coerce"),
+            })
+
+if rows_all:
+    df_detailed = pd.DataFrame(rows_all)
+    # Tri par Patient puis prix croissant (avec gestion NaN en fin)
+    df_detailed = df_detailed.sort_values(
+        by=["Patient", "Prix_num", "Source", "Acte (Source)"],
+        ascending=[True, True, True, True]
+    )
+    st.dataframe(df_detailed.drop(columns=["Prix_num"]), use_container_width=True, hide_index=True)
+
+    csv_det = df_detailed.drop(columns=["Prix_num"]).to_csv(index=False, sep=";", encoding="utf-8-sig")
+    st.download_button(
+        "⬇️ Télécharger la vue détaillée (CSV, toutes les lignes triées)",
+        data=csv_det,
+        file_name="VueDetaillee_ToutesLignes_TriPrix.csv",
+        mime="text/csv"
+    )
+else:
+    st.info("Aucune ligne détaillée à afficher (pas de correspondances trouvées).")
+
+# ==================== Filtres rapides (optionnels) ====================
 st.markdown("**Filtres rapides :**")
 col_f1, col_f2, col_f3, col_f4 = st.columns(4)
 with col_f1:
@@ -614,16 +675,16 @@ if show_only_orphans:
     df_filtered = df_filtered[df_filtered["Statut Global"].str.startswith("🟧")]
 
 if show_only_both or show_only_one or show_only_none or show_only_orphans:
-    st.dataframe(df_filtered.drop(columns=["Prix_num"]), use_container_width=True, hide_index=True)
+    st.dataframe(df_filtered, use_container_width=True, hide_index=True)
 
-# ==================== TÉLÉCHARGEMENT ====================
-csv_out = df_final.drop(columns=["Prix_num"]).to_csv(index=False, sep=";", encoding="utf-8-sig")
+# ==================== 5) TÉLÉCHARGEMENT TABLEAU PRINCIPAL ====================
+csv_out = df_final.to_csv(index=False, sep=";", encoding="utf-8-sig")
 st.download_button(
-    label="⬇️ Télécharger le tableau (CSV)",
+    label="⬇️ Télécharger le tableau fusionné (CSV)",
     data=csv_out,
-    file_name="Comparaison_ToutesCorrespondances_TriPrix.csv",
+    file_name="Fusion_Resultat_Desmos_Cosmident.csv",
     mime="text/csv",
 )
 
 st.divider()
-st.info("Le tableau comparé et coloré affiche désormais TOUTES les correspondances Cosmident et Desmos pour chaque patient, triées par prix croissant. Les orphelins Cosmident sont en tête (🟧).")
+st.info("La 'Vue détaillée' affiche toutes les correspondances par patient (Cosmident & Desmos), triées par prix croissant. Ajuste la tolérance et le seuil dans la barre latérale pour être plus ou moins permissif.")
