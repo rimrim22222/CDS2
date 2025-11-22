@@ -7,7 +7,6 @@ import io
 import unicodedata
 from pathlib import Path
 import fitz  # PyMuPDF
-from PIL import Image
 
 # ==================== CONFIG & LOGO ====================
 st.set_page_config(page_title="Gestion + Comparaison Prothèses", page_icon="🦷", layout="wide")
@@ -29,7 +28,18 @@ with col_title:
 
 st.divider()
 
-# ==================== UTILITAIRES NOM (ULTRA-PERMISSIF) ====================
+# ==================== PARAMÈTRES (barre latérale) ====================
+with st.sidebar:
+    st.header("Paramètres de matching")
+    FUZZY_REL_ERR = st.slider("Tolérance aux fautes (édition, %)", 5, 40, 20) / 100.0  # 0.20 par défaut
+    SCORE_THRESHOLD = st.slider("Seuil de score global (0.30–0.80)", 0.30, 0.80, 0.50)
+    st.caption("Plus la tolérance et le score seuil sont bas, plus le matching est permissif.")
+    ORPHANS_ONLY_ABSENT_IN_RESULT = st.checkbox(
+        "🟧 Orphelins Cosmident = Absents dans Résultat (peu importe Desmos)",
+        value=False
+    )
+
+# ==================== UTILITAIRES NOM (ULTRA-PERMISSIF, corrigés) ====================
 COMMON_WORDS = {
     "de","du","des","la","le","les","d","l","mr","mme","m","monsieur","madame"
 }
@@ -42,7 +52,6 @@ def strip_accents(s: str) -> str:
     return s_clean
 
 def canonical_tokens(name: str) -> list:
-    # découpe sur espaces et tirets, supprime mots communs et tokens trop courts
     raw = strip_accents(name)
     toks = []
     for t in re.split(r"[ \-]+", raw):
@@ -52,42 +61,41 @@ def canonical_tokens(name: str) -> list:
         if t in COMMON_WORDS:
             continue
         toks.append(t)
-    # tri pour ignorer inversion nom/prénom
-    return sorted(toks)
+    return sorted(toks)  # tri pour ignorer inversion nom/prénom
 
 def levenshtein(a: str, b: str) -> int:
-    # distance d’édition classique
+    """Distance d’édition (programmation dynamique, une ligne mémoire)."""
     if a == b:
         return 0
-    if not a:
-        return len(b)
-    if not b:
-        return len(a)
-    dp = list(range(len(b) + 1))
+    n, m = len(a), len(b)
+    if n == 0:
+        return m
+    if m == 0:
+        return n
+    prev_row = list(range(m + 1))
     for i, ca in enumerate(a, 1):
-        prev = dp[0]
-        dp[0] = i
+        curr = [i]
         for j, cb in enumerate(b, 1):
-            cost = 0 if ca == cb else 1
-            dp[i_j := j] = min(
-                dp[i_j] + 1,      # insertion
-                dp[i_j - 1] + 1,  # suppression
-                prev + cost       # substitution
-            )
-            prev = dp[i_j]
-    return dp[len(b)]
+            insert_cost = curr[j - 1] + 1
+            delete_cost = prev_row[j] + 1
+            subst_cost  = prev_row[j - 1] + (0 if ca == cb else 1)
+            curr.append(min(insert_cost, delete_cost, subst_cost))
+        prev_row = curr
+    return prev_row[-1]
 
-def fuzzy_equal(a: str, b: str, max_rel_err: float = 0.2) -> bool:
-    # tolère petites fautes: distance <= 20% de la longueur max
+def fuzzy_equal(a: str, b: str) -> bool:
+    """
+    Tolère petites fautes: distance d'édition <= FUZZY_REL_ERR * longueur max.
+    """
     if a == b:
         return True
-    L = max(len(a), len(b))
-    if L == 0:
+    if not a or not b:
         return False
-    return levenshtein(a, b) / L <= max_rel_err
+    L = max(len(a), len(b))
+    return (levenshtein(a, b) / L) <= FUZZY_REL_ERR
 
 def match_tokens_count(ta: list, tb: list) -> int:
-    # compte les correspondances en évitant les doublons (greedy)
+    """Greedy matching de tokens entre deux listes, avec fuzzy_equal, sans doublons côté B."""
     used_b = set()
     k = 0
     for a in ta:
@@ -101,33 +109,30 @@ def match_tokens_count(ta: list, tb: list) -> int:
     return k
 
 def core_tokens(tokens: list, n: int = 2) -> list:
-    # prend les n tokens les plus longs (souvent nom + prénom)
     return sorted(tokens, key=len, reverse=True)[:n]
 
 def names_match_permissive(name_a: str, name_b: str) -> tuple[bool, float]:
     """
-    Retourne (match_bool, score) avec règles permissives:
+    (match_bool, score) — règles permissives :
     - couverture k / min(lenA, lenB) >= 0.66
     - OU k >= 2
-    - OU les 2 core tokens d’un nom sont trouvés dans l’autre (exact ou fuzzy)
-    Le score combine couverture + jaccard + core bonus.
+    - OU les 2 tokens cœur d’un nom sont présents dans l’autre (exact ou fuzzy)
+    Score = 0.6 * couverture + 0.4 * jaccard + 0.15 * core_bonus
     """
     ta = canonical_tokens(name_a)
     tb = canonical_tokens(name_b)
     if not ta or not tb:
         return (False, 0.0)
 
-    # exact set equality
     if set(ta) == set(tb):
         return (True, 1.0)
 
     k = match_tokens_count(ta, tb)
-    minlen = min(len(ta), len(tb))
-    union = len(set(ta) | set(tb))
-    coverage = k / minlen if minlen else 0.0
-    jacc = k / union if union else 0.0
+    minlen = min(len(ta), len(tb)) or 1
+    union = len(set(ta) | set(tb)) or 1
+    coverage = k / minlen
+    jacc = k / union
 
-    # core bonus: 2 tokens clés d’un côté présents dans l’autre
     ca = core_tokens(ta, 2)
     cb = core_tokens(tb, 2)
 
@@ -136,13 +141,10 @@ def names_match_permissive(name_a: str, name_b: str) -> tuple[bool, float]:
         for c in cside:
             if any(c == o or fuzzy_equal(c, o) for o in other):
                 hits += 1
-        return hits >= 2  # les 2 trouvés
+        return hits >= 2
 
     core_bonus = 1.0 if (core_hit(ca, tb) or core_hit(cb, ta)) else 0.0
-
-    # score composite
     score = 0.6 * coverage + 0.4 * jacc + 0.15 * core_bonus
-    # décision permissive
     match = (coverage >= 0.66) or (k >= 2) or (core_bonus > 0.0)
 
     return (match, score)
@@ -158,16 +160,18 @@ def make_index(df: pd.DataFrame, col_name: str) -> dict:
             idx.setdefault(key, []).append(r)
     return idx
 
-def best_match_row(target_name: str, index: dict):
+def best_match_row(target_name: str, index: dict, score_threshold: float | None = None):
     """
     Cherche le meilleur candidat par score permissif.
-    Retourne la ligne si score >= 0.5 (assez permissif), sinon None.
+    Retourne la ligne si score >= score_threshold (par défaut : SCORE_THRESHOLD).
     """
+    if score_threshold is None:
+        score_threshold = SCORE_THRESHOLD
     target_key = " ".join(canonical_tokens(target_name))
     if not target_key or not index:
         return None
 
-    # prioriser la clé exacte
+    # priorité: clé exacte
     if target_key in index:
         return index[target_key][0]
 
@@ -179,7 +183,7 @@ def best_match_row(target_name: str, index: dict):
             best = rows[0]
             best_score = score
 
-    return best if best_score >= 0.5 else None  # seuil permissif
+    return best if best_score >= score_threshold else None
 
 # ==================== 1) EXTRACTION DES ACTES (Excel de facturation) ====================
 st.subheader("1) Extraction des actes prothétiques (Excel de facturation)")
@@ -508,7 +512,7 @@ df_out["Statut Global"] = ""  # 🟩 / 🟦 / 🟥
 for i, row in df_out.iterrows():
     pname = str(row["Patient"])
 
-    r_des = best_match_row(pname, index_des)
+    r_des = best_match_row(pname, index_des, SCORE_THRESHOLD)
     if r_des is not None:
         df_out.at[i, "Match Desmos"] = True
         df_out.at[i, "Acte Desmos"] = str(r_des.get("Acte Desmos", ""))
@@ -517,7 +521,7 @@ for i, row in df_out.iterrows():
     else:
         df_out.at[i, "Statut Desmos"] = "aucun match Desmos"
 
-    r_cos = best_match_row(pname, index_cos)
+    r_cos = best_match_row(pname, index_cos, SCORE_THRESHOLD)
     if r_cos is not None:
         df_out.at[i, "Match Cosmident"] = True
         df_out.at[i, "Acte Cosmident"] = str(r_cos.get("Acte Cosmident", ""))
@@ -540,9 +544,13 @@ cos_orphans = []
 if not df_cos.empty:
     for _, r in df_cos.iterrows():
         pname_cos = str(r["Patient"])
-        m_res = best_match_row(pname_cos, index_res)
-        m_des = best_match_row(pname_cos, index_des)
-        if m_res is None and m_des is None:
+        m_res = best_match_row(pname_cos, index_res, SCORE_THRESHOLD)
+        if ORPHANS_ONLY_ABSENT_IN_RESULT:
+            is_orphan = (m_res is None)
+        else:
+            m_des = best_match_row(pname_cos, index_des, SCORE_THRESHOLD)
+            is_orphan = (m_res is None and m_des is None)
+        if is_orphan:
             cos_orphans.append({
                 "Patient": pname_cos,
                 "Dent": "",
@@ -635,4 +643,3 @@ st.download_button(
 )
 
 st.divider()
-st.info("Matching patient ultra-permissif activé. Exemple: 'LESCURE SELLIER HAUSSEGUY FLORENCE' correspond à 'FLORENCE LESCURE'.")
