@@ -23,38 +23,27 @@ else:
     st.caption("Logo manquant → place logo.png à la racine de l’app")
 
 st.title("Gestion des Prothèses — Desmos (Excel) + Cosmident (PDF)")
-st.caption("Extraction HBLDxxx / HBMD351 / HBLD634, rapprochement et export Excel stylé")
+st.caption("Comparaison uniquement sur le nom du patient (Acte/€ Cosmident ajoutés).")
 
 # ==================== SIDEBAR PARAMS ====================
 with st.sidebar:
     st.subheader("Paramètres")
-    # Debug
     debug_desmos = st.toggle("Debug Desmos (lecture des lignes)", value=False)
     max_debug_rows_desmos = st.number_input("Lignes debug Desmos", min_value=10, max_value=1000, value=150, step=10)
 
     debug_pdf = st.toggle("Debug Cosmident PDF (texte des pages)", value=False)
-    max_debug_pages_pdf = st.number_input("Pages à afficher en debug PDF", min_value=1, max_value=50, value=4, step=1)
+    max_debug_pages_pdf = st.number_input("Pages debug PDF", min_value=1, max_value=50, value=4, step=1)
 
     st.markdown("---")
-    st.caption("Filtres Codes (appliqués aux résultats Desmos et Cosmident)")
+    st.caption("Filtres Codes (appliqués aux deux sources)")
     keep_hbmd351 = st.checkbox("Conserver HBMD351", value=True)
     keep_hbld634 = st.checkbox("Conserver HBLD634", value=True)
     keep_all_hbld = st.checkbox("Conserver tous les HBLD*", value=True)
-
     exclude_hbld490 = st.checkbox("Exclure HBLD490 (transitoire)", value=True)
     exclude_hbld045 = st.checkbox("Exclure HBLD045", value=True)
 
     st.markdown("---")
-    st.caption("Clé de rapprochement")
-    join_key = st.radio("Choix de la clé", ["Patient", "Patient + Dent", "Patient + Code"], index=0)
-
-    st.caption("Stratégie Cosmident si plusieurs actes sur la même clé")
-    cosmident_strategy = st.selectbox("Stratégie multi-lignes", ["Premier acte", "Concat actes", "Somme des tarifs"], index=0)
-
-    st.caption("Dents multiples (ex. '11-12')")
-    duplicate_multi_dents = st.checkbox("Dupliquer l'acte pour chaque dent détectée", value=False)
-
-    st.markdown("---")
+    duplicate_multi_dents = st.checkbox("Dupliquer les actes Cosmident pour dents multiples (11-12)", value=False)
     search_text = st.text_input("Recherche plein texte (toutes colonnes)", "")
 
 # ==================== UPLOADS ====================
@@ -180,7 +169,7 @@ def find_code_cell(values):
             return cell, i
     return None, -1
 
-def find_tarif_right(values, code_idx, span=5):
+def sanitize_number_right(values, code_idx, span=5):
     for offset in range(1, span+1):
         j = code_idx + offset
         if j < len(values):
@@ -228,7 +217,6 @@ def parse_desmos_excel(desmos_file, debug=False, max_debug_rows=150,
             st.write(f"**Desmos Ligne {idx}** | Patient courant : {current_patient or '(aucun)'}")
             st.code(row_text)
 
-        # Reset bloc totals
         if re.search(r"Factures et Avoirs\s+CENTRE DE SANTÉ DES LAURIERS", row_text, re.I):
             current_patient = None
             continue
@@ -244,13 +232,12 @@ def parse_desmos_excel(desmos_file, debug=False, max_debug_rows=150,
         code, code_idx = find_code_cell(values)
         if not code:
             continue
-
         if exclude_hbld490 and code == "HBLD490":
             continue
         if exclude_hbld045 and code == "HBLD045":
             continue
 
-        tarif = find_tarif_right(values, code_idx, span=5)
+        tarif = sanitize_number_right(values, code_idx, span=5)
         dent = find_dent_left(values, code_idx, span=25)
         acte = find_acte_left(values, code_idx, span=40)
 
@@ -276,16 +263,10 @@ CODE_RE = re.compile(r"\b(HBLD\d{3}|HBMD351|HBLD634)\b", re.I)
 MONEY_RE = re.compile(r"(\d{1,6}[,.]\d{2})")
 
 def detect_patient_pdf(lines, i):
-    """
-    Cherche: 'Patient : NOM PRENOM' ou la ligne MAJ avant 'N° Dossier'
-    """
-    line = lines[i]
-    m = re.search(r"Patient\s*[:\-]\s*(.+)", line, re.I)
+    m = re.search(r"Patient\s*[:\-]\s*(.+)", lines[i], re.I)
     if m:
         return m.group(1).strip()
-
-    # si la ligne contient 'N° Dossier', remonter 1..5 lignes pour un nom MAJUSCULE
-    if re.search(r"N°\s*Dossier", line, re.I):
+    if re.search(r"N°\s*Dossier", lines[i], re.I):
         for back in range(1, 6):
             if i - back >= 0:
                 cand = lines[i - back].strip()
@@ -294,10 +275,6 @@ def detect_patient_pdf(lines, i):
     return None
 
 def find_acte_pdf(lines, i_code):
-    """
-    Dernière ligne textuelle non vide avant le code,
-    en évitant une autre ligne 'code' ou un pur nombre.
-    """
     for back in range(1, 8):
         j = i_code - back
         if j >= 0:
@@ -307,9 +284,6 @@ def find_acte_pdf(lines, i_code):
     return "?"
 
 def find_tarif_pdf(lines, i_code):
-    """
-    Cherche d'abord sur la ligne du code puis dans les 5 lignes suivantes.
-    """
     inline = MONEY_RE.findall(lines[i_code].replace(" ", ""))
     if inline:
         return inline[0].replace(".", ",")
@@ -322,11 +296,6 @@ def find_tarif_pdf(lines, i_code):
     return "?"
 
 def find_dent_pdf(lines, i_code):
-    """
-    Cherche une dent 1..48 dans les 5 lignes précédentes.
-    Gère '11-12' / '11;12' : retourne '11-12' brut et on duplique plus tard si demandé.
-    """
-    # d'abord pattern multiple
     for back in range(1, 6):
         j = i_code - back
         if j >= 0:
@@ -334,7 +303,6 @@ def find_dent_pdf(lines, i_code):
             m_multi = re.search(r"\b(\d{1,2})(?:\s*[-;,/]\s*(\d{1,2}))+\b", cand)
             if m_multi:
                 return cand.strip()
-    # sinon une seule dent
     for back in range(1, 6):
         j = i_code - back
         if j >= 0:
@@ -347,10 +315,6 @@ def find_dent_pdf(lines, i_code):
     return "?"
 
 def expand_multi_dents(dent_str):
-    """
-    '11-12-13' -> ['11','12','13'] ; '11;12' -> ['11','12'] ; '11/21' -> ['11','21']
-    Retourne [dent_str] si non multiple.
-    """
     s = str(dent_str)
     if re.search(r"[-;,/]", s):
         parts = re.split(r"[-;,/]\s*", s)
@@ -384,20 +348,16 @@ def parse_cosmident_pdf(cosmi_pdf_bytes: bytes,
             st.code("\n".join(lines[:120]))
 
         current_patient = None
-        # balayage
         for i, line in enumerate(lines):
-            # reset sur blocs totals
             if re.search(r"Total des Factures et Avoirs|Factures et Avoirs", line, re.I):
                 current_patient = None
                 continue
 
-            # patient
             m_pat = detect_patient_pdf(lines, i)
             if m_pat:
                 current_patient = m_pat
                 continue
 
-            # code
             m_code = CODE_RE.search(line)
             if not m_code or not current_patient:
                 continue
@@ -412,7 +372,6 @@ def parse_cosmident_pdf(cosmi_pdf_bytes: bytes,
             tarif = find_tarif_pdf(lines, i)
             dent = find_dent_pdf(lines, i)
 
-            # enregistrement (avec duplication éventuelle)
             dents_list = expand_multi_dents(dent) if duplicate_multi_dents else [dent]
             for d in dents_list:
                 results.append({
@@ -429,13 +388,12 @@ def parse_cosmident_pdf(cosmi_pdf_bytes: bytes,
         df["Tarif_Cosmident_float"] = df["Tarif_Cosmident"].apply(to_float_eu)
     return df
 
-# ==================== PIPELINE ====================
+# ==================== PIPELINE (JOINTURE UNIQUEMENT SUR PATIENT) ====================
 if desmos_file and cosmi_pdf:
     # --- DESMOS ---
     df_des = parse_desmos_excel(desmos_file,
                                 debug=debug_desmos, max_debug_rows=max_debug_rows_desmos,
                                 exclude_hbld490=exclude_hbld490, exclude_hbld045=exclude_hbld045)
-
     if df_des.empty:
         st.warning("Desmos n’a produit aucun acte.")
         st.stop()
@@ -460,55 +418,22 @@ if desmos_file and cosmi_pdf:
                                  exclude_hbld045=exclude_hbld045,
                                  duplicate_multi_dents=duplicate_multi_dents,
                                  debug=debug_pdf, max_debug_pages=max_debug_pages_pdf)
-    if df_cos.empty:
-        st.warning("Cosmident PDF n’a produit aucune ligne exploitable (PDF peut être scanné / image).")
 
-    # --- CLÉ DE RAPPROCHEMENT ---
-    if join_key == "Patient":
-        df_des["JOIN_KEY"] = df_des["Patient_norm"]
-        df_cos["JOIN_KEY"] = df_cos["Patient_norm"] if not df_cos.empty else ""
-    elif join_key == "Patient + Dent":
-        df_des["JOIN_KEY"] = df_des["Patient_norm"] + "||" + df_des["Dent"].astype(str)
-        if not df_cos.empty:
-            df_cos["JOIN_KEY"] = df_cos["Patient_norm"] + "||" + df_cos["Dent"].astype(str)
-    else:  # Patient + Code
-        df_des["JOIN_KEY"] = df_des["Patient_norm"] + "||" + df_des["Code"].astype(str).str.upper()
-        if not df_cos.empty:
-            df_cos["JOIN_KEY"] = df_cos["Patient_norm"] + "||" + df_cos["Code"].astype(str).str.upper()
-
-    # --- AGRÉGATION COSMIDENT SELON STRATÉGIE ---
+    # --- Agrégation Cosmident par NOM PATIENT UNIQUEMENT ---
     if not df_cos.empty:
-        if cosmident_strategy == "Premier acte":
-            df_cos_agg = df_cos.sort_index().groupby("JOIN_KEY").agg({
-                "Acte_Cosmident": "first",
-                "Tarif_Cosmident": "first",
-                "Tarif_Cosmident_float": "sum"
-            }).reset_index()
-            df_cos_agg["Nb_actes_Cosmi"] = df_cos.groupby("JOIN_KEY").size().values
-        elif cosmident_strategy == "Concat actes":
-            df_cos_agg = df_cos.groupby("JOIN_KEY").agg({
-                "Acte_Cosmident": lambda s: " | ".join(map(str, s)),
-                "Tarif_Cosmident": "first",
-                "Tarif_Cosmident_float": "sum"
-            }).reset_index()
-            df_cos_agg["Nb_actes_Cosmi"] = df_cos.groupby("JOIN_KEY").size().values
-        else:  # Somme des tarifs
-            df_cos_agg = df_cos.groupby("JOIN_KEY").agg({
-                "Acte_Cosmident": "first",
-                "Tarif_Cosmident_float": "sum"
-            }).reset_index()
-            df_cos_agg["Tarif_Cosmident"] = df_cos_agg["Tarif_Cosmident_float"].map(
-                lambda v: f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", " ")
-            )
-            df_cos_agg["Nb_actes_Cosmi"] = df_cos.groupby("JOIN_KEY").size().values
-        df_cos_agg.rename(columns={"Tarif_Cosmident_float": "Total_Cosmi_float"}, inplace=True)
+        # On agrège par patient normalisé, et on garde le premier acte + premier tarif.
+        df_cos_agg = df_cos.sort_index().groupby("Patient_norm").agg({
+            "Acte_Cosmident": "first",
+            "Tarif_Cosmident": "first"
+        }).reset_index()
+        df_cos_agg["Nb_actes_Cosmi"] = df_cos.groupby("Patient_norm").size().values
     else:
-        df_cos_agg = pd.DataFrame(columns=["JOIN_KEY", "Acte_Cosmident", "Tarif_Cosmident", "Nb_actes_Cosmi", "Total_Cosmi_float"])
+        df_cos_agg = pd.DataFrame(columns=["Patient_norm", "Acte_Cosmident", "Tarif_Cosmident", "Nb_actes_Cosmi"])
 
-    # --- MERGE ---
-    df_merge = df_des.merge(df_cos_agg, on="JOIN_KEY", how="left")
+    # --- Jointure sur Patient_norm uniquement ---
+    df_merge = df_des.merge(df_cos_agg, on="Patient_norm", how="left")
 
-    # --- RECHERCHE PLEIN TEXTE ---
+    # --- Recherche plein texte ---
     if search_text.strip():
         q = search_text.strip().lower()
         cols = ["Patient", "Dent", "Code", "Acte", "Tarif", "Acte_Cosmident", "Tarif_Cosmident"]
@@ -518,33 +443,39 @@ if desmos_file and cosmi_pdf:
                 mask |= df_merge[c].astype(str).str.lower().str.contains(q, na=False)
         df_merge = df_merge[mask].copy()
 
-    # --- AFFICHAGE ---
-    affichage_cols = ["Patient", "Dent", "Code", "Acte", "Tarif", "Acte_Cosmident", "Tarif_Cosmident", "Nb_actes_Cosmi"]
+    # --- Indicateur de match ---
+    df_merge["Cosmident_match"] = df_merge["Acte_Cosmident"].notna()
+
+    # --- Affichage ---
+    affichage_cols = ["Patient", "Dent", "Code", "Acte", "Tarif", "Acte_Cosmident", "Tarif_Cosmident", "Nb_actes_Cosmi", "Cosmident_match"]
     affichage_cols = [c for c in affichage_cols if c in df_merge.columns]
-    st.success(f"**{len(df_merge)} actes rapprochés (Desmos + Cosmident)**")
+
+    st.success(f"**{len(df_merge)} actes rapprochés (jointure par NOM PATIENT)**")
     st.dataframe(df_merge[affichage_cols], use_container_width=True, hide_index=True)
 
-    # --- EXPORTS ---
+    # --- Exports ---
     csv = df_merge[affichage_cols].to_csv(index=False, sep=";", encoding="utf-8-sig")
-    st.download_button("Télécharger le CSV", data=csv, file_name="Protheses_Desmos_Cosmident.csv", mime="text/csv")
+    st.download_button("Télécharger le CSV", data=csv, file_name="Protheses_Desmos_Cosmident_byPatient.csv", mime="text/csv")
 
-    xls = style_dataframe_to_excel(df_merge[affichage_cols], money_columns=["Tarif", "Tarif_Cosmident"], sheet_name="Actes rapprochés")
-    st.download_button("Télécharger l'Excel (.xlsx)", data=xls, file_name="Protheses_Desmos_Cosmident.xlsx",
+    xls = style_dataframe_to_excel(df_merge[affichage_cols], money_columns=["Tarif", "Tarif_Cosmident"], sheet_name="Actes rapprochés (par patient)")
+    st.download_button("Télécharger l'Excel (.xlsx)", data=xls, file_name="Protheses_Desmos_Cosmident_byPatient.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
     # --- Récap par patient (Desmos) ---
     df_merge["Tarif_float"] = df_merge["Tarif"].apply(to_float_eu)
     recap = df_merge.groupby("Patient").agg(
         Actes=("Code", "count"),
-        Total_float=("Tarif_float", "sum")
+        Total_float=("Tarif_float", "sum"),
+        Cosmident_trouvé=("Cosmident_match", "max")
     ).reset_index()
     recap["Total (€)"] = recap["Total_float"].map(lambda v: f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", " "))
-    recap = recap[["Patient", "Actes", "Total (€)"]]
-    st.subheader("Récapitulatif par patient (Desmos)")
+    recap = recap[["Patient", "Actes", "Total (€)", "Cosmident_trouvé"]]
+
+    st.subheader("Récapitulatif par patient (Desmos, match Cosmident oui/non)")
     st.dataframe(recap, use_container_width=True, hide_index=True)
 
-    xls_sum = style_summary_to_excel(recap, sheet_name="Récap Desmos")
-    st.download_button("Télécharger le récap patients (.xlsx)", data=xls_sum, file_name="Recap_Desmos_Patients.xlsx",
+    xls_sum = style_summary_to_excel(recap, sheet_name="Récap par patient")
+    st.download_button("Télécharger le récap (.xlsx)", data=xls_sum, file_name="Recap_Desmos_byPatient.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 else:
