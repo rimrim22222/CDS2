@@ -25,52 +25,163 @@ with col_logo:
         st.caption("Logo manquant → place logo.png à la racine de l’app")
 with col_title:
     st.title("Gestion des Prothèses + Comparaison Cosmident / Desmos")
-    st.caption("Extraction HBLDxxx, HBMD351, HBLD634 → Matching par patient (tolérant inversion Nom/Prénom, accents, casse)")
+    st.caption("Matching patient ultra-permissif (inversions, tokens supplémentaires, petites fautes)")
 
 st.divider()
 
-# ==================== OUTILS NOM (pour matching) ====================
+# ==================== UTILITAIRES NOM (ULTRA-PERMISSIF) ====================
+COMMON_WORDS = {
+    "de","du","des","la","le","les","d","l","mr","mme","m","monsieur","madame"
+}
+
 def strip_accents(s: str) -> str:
     s_norm = unicodedata.normalize("NFD", str(s))
     s_no = "".join(ch for ch in s_norm if unicodedata.category(ch) != "Mn")
-    s_clean = re.sub(r"[^a-zA-Z\s]", " ", s_no)
+    s_clean = re.sub(r"[^a-zA-Z\s\-']", " ", s_no)
     s_clean = re.sub(r"\s+", " ", s_clean).strip().lower()
     return s_clean
 
 def canonical_tokens(name: str) -> list:
-    return sorted([t for t in strip_accents(name).split() if len(t) >= 2])
+    # découpe sur espaces et tirets, supprime mots communs et tokens trop courts
+    raw = strip_accents(name)
+    toks = []
+    for t in re.split(r"[ \-]+", raw):
+        t = t.strip()
+        if not t or len(t) < 2:
+            continue
+        if t in COMMON_WORDS:
+            continue
+        toks.append(t)
+    # tri pour ignorer inversion nom/prénom
+    return sorted(toks)
 
-def jaccard(a: set, b: set) -> float:
-    if not a and not b:
-        return 1.0
-    inter = len(a & b); union = len(a | b)
-    return inter / union if union else 0.0
+def levenshtein(a: str, b: str) -> int:
+    # distance d’édition classique
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    dp = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        prev = dp[0]
+        dp[0] = i
+        for j, cb in enumerate(b, 1):
+            cost = 0 if ca == cb else 1
+            dp[i_j := j] = min(
+                dp[i_j] + 1,      # insertion
+                dp[i_j - 1] + 1,  # suppression
+                prev + cost       # substitution
+            )
+            prev = dp[i_j]
+    return dp[len(b)]
 
-def best_match_row(target_name: str, index: dict, threshold: float = 0.75):
-    tkey = " ".join(canonical_tokens(target_name))
-    if not tkey or not index:
-        return None
-    if tkey in index:
-        return index[tkey][0]
-    best = None; best_score = 0.0
-    tset = set(tkey.split())
-    for k, rows in index.items():
-        score = jaccard(tset, set(k.split()))
-        if score > best_score:
-            best_score = score; best = rows[0]
-    return best if best_score >= threshold else None
+def fuzzy_equal(a: str, b: str, max_rel_err: float = 0.2) -> bool:
+    # tolère petites fautes: distance <= 20% de la longueur max
+    if a == b:
+        return True
+    L = max(len(a), len(b))
+    if L == 0:
+        return False
+    return levenshtein(a, b) / L <= max_rel_err
+
+def match_tokens_count(ta: list, tb: list) -> int:
+    # compte les correspondances en évitant les doublons (greedy)
+    used_b = set()
+    k = 0
+    for a in ta:
+        for j, b in enumerate(tb):
+            if j in used_b:
+                continue
+            if a == b or fuzzy_equal(a, b):
+                used_b.add(j)
+                k += 1
+                break
+    return k
+
+def core_tokens(tokens: list, n: int = 2) -> list:
+    # prend les n tokens les plus longs (souvent nom + prénom)
+    return sorted(tokens, key=len, reverse=True)[:n]
+
+def names_match_permissive(name_a: str, name_b: str) -> tuple[bool, float]:
+    """
+    Retourne (match_bool, score) avec règles permissives:
+    - couverture k / min(lenA, lenB) >= 0.66
+    - OU k >= 2
+    - OU les 2 core tokens d’un nom sont trouvés dans l’autre (exact ou fuzzy)
+    Le score combine couverture + jaccard + core bonus.
+    """
+    ta = canonical_tokens(name_a)
+    tb = canonical_tokens(name_b)
+    if not ta or not tb:
+        return (False, 0.0)
+
+    # exact set equality
+    if set(ta) == set(tb):
+        return (True, 1.0)
+
+    k = match_tokens_count(ta, tb)
+    minlen = min(len(ta), len(tb))
+    union = len(set(ta) | set(tb))
+    coverage = k / minlen if minlen else 0.0
+    jacc = k / union if union else 0.0
+
+    # core bonus: 2 tokens clés d’un côté présents dans l’autre
+    ca = core_tokens(ta, 2)
+    cb = core_tokens(tb, 2)
+
+    def core_hit(cside, other):
+        hits = 0
+        for c in cside:
+            if any(c == o or fuzzy_equal(c, o) for o in other):
+                hits += 1
+        return hits >= 2  # les 2 trouvés
+
+    core_bonus = 1.0 if (core_hit(ca, tb) or core_hit(cb, ta)) else 0.0
+
+    # score composite
+    score = 0.6 * coverage + 0.4 * jacc + 0.15 * core_bonus
+    # décision permissive
+    match = (coverage >= 0.66) or (k >= 2) or (core_bonus > 0.0)
+
+    return (match, score)
 
 def make_index(df: pd.DataFrame, col_name: str) -> dict:
     idx = {}
     if df is None or df.empty or col_name not in df.columns:
         return idx
     for _, r in df.iterrows():
-        key = " ".join(canonical_tokens(str(r[col_name])))
+        key_tokens = canonical_tokens(str(r[col_name]))
+        key = " ".join(key_tokens)
         if key:
             idx.setdefault(key, []).append(r)
     return idx
 
-# ==================== 1) EXTRACTION DES ACTES (Excel facturation) ====================
+def best_match_row(target_name: str, index: dict):
+    """
+    Cherche le meilleur candidat par score permissif.
+    Retourne la ligne si score >= 0.5 (assez permissif), sinon None.
+    """
+    target_key = " ".join(canonical_tokens(target_name))
+    if not target_key or not index:
+        return None
+
+    # prioriser la clé exacte
+    if target_key in index:
+        return index[target_key][0]
+
+    best = None
+    best_score = 0.0
+    for cand_key, rows in index.items():
+        match, score = names_match_permissive(target_key, cand_key)
+        if match and score > best_score:
+            best = rows[0]
+            best_score = score
+
+    return best if best_score >= 0.5 else None  # seuil permissif
+
+# ==================== 1) EXTRACTION DES ACTES (Excel de facturation) ====================
 st.subheader("1) Extraction des actes prothétiques (Excel de facturation)")
 uploaded_facturation = st.file_uploader("📥 Charge le fichier Excel (facturation)", type=["xls", "xlsx"])
 
@@ -211,11 +322,9 @@ def extract_data_from_cosmident(file):
         st.error(f"Erreur ouverture PDF Cosmident : {e}")
         return pd.DataFrame()
 
-    # Aperçu debug
     with st.expander("🧩 Aperçu du texte extrait (Cosmident brut)", expanded=False):
         st.write(full_text[:2000])
 
-    # Nettoyage
     lines = full_text.split("\n")
     clean_lines = []
     for line in lines:
@@ -238,7 +347,6 @@ def extract_data_from_cosmident(file):
         line = clean_lines[i]
         i += 1
 
-        # Ref Patient
         ref_match = re.search(r"Ref\.?\s*(?:Patient\s*)?:?\s*([\w\s\-'’]+)", line, re.IGNORECASE)
         if ref_match:
             if current_patient and current_description and current_numbers:
@@ -257,11 +365,9 @@ def extract_data_from_cosmident(file):
             current_numbers = []
             continue
 
-        # Ignorer tant qu'on n'a pas un patient
         if current_patient is None:
             continue
 
-        # Nombres/prix
         this_numbers = re.findall(r"\d+[\.,]\d{2}", line)
         norm_numbers = [n.replace(",", ".") for n in this_numbers]
         this_text = re.sub(r"\s*\d+[\.,]\d{2}\s*", " ", line).strip()
@@ -285,7 +391,6 @@ def extract_data_from_cosmident(file):
         if norm_numbers:
             current_numbers.extend(norm_numbers)
 
-    # Dernier acte
     if current_patient and current_description and current_numbers:
         try:
             total = float(str(current_numbers[-1]).replace(",", "."))
@@ -388,25 +493,22 @@ index_cos = make_index(df_cos, "Patient") if not df_cos.empty else {}
 
 df_out = df_result.copy()
 
-# Flags et champs
 df_out["Match Desmos"] = False
 df_out["Acte Desmos"] = ""
 df_out["Prix Desmos"] = ""
+df_out["Statut Desmos"] = ""  # "match" ou "aucun match Desmos"
 
 df_out["Match Cosmident"] = False
 df_out["Acte Cosmident"] = ""
 df_out["Prix Cosmident"] = ""
+df_out["Statut Cosmident"] = ""  # "match" ou "aucun match Cosmident"
 
-# Statuts détaillés
-df_out["Statut Desmos"] = ""       # "match" ou "aucun match Desmos"
-df_out["Statut Cosmident"] = ""    # "match" ou "aucun match Cosmident"
-df_out["Statut Global"] = ""       # 🟩 / 🟦 / 🟥 / 🟧
+df_out["Statut Global"] = ""  # 🟩 / 🟦 / 🟥
 
 for i, row in df_out.iterrows():
     pname = str(row["Patient"])
 
-    # ----- Desmos -----
-    r_des = best_match_row(pname, index_des, threshold=0.75)
+    r_des = best_match_row(pname, index_des)
     if r_des is not None:
         df_out.at[i, "Match Desmos"] = True
         df_out.at[i, "Acte Desmos"] = str(r_des.get("Acte Desmos", ""))
@@ -415,8 +517,7 @@ for i, row in df_out.iterrows():
     else:
         df_out.at[i, "Statut Desmos"] = "aucun match Desmos"
 
-    # ----- Cosmident -----
-    r_cos = best_match_row(pname, index_cos, threshold=0.75)
+    r_cos = best_match_row(pname, index_cos)
     if r_cos is not None:
         df_out.at[i, "Match Cosmident"] = True
         df_out.at[i, "Acte Cosmident"] = str(r_cos.get("Acte Cosmident", ""))
@@ -425,7 +526,6 @@ for i, row in df_out.iterrows():
     else:
         df_out.at[i, "Statut Cosmident"] = "aucun match Cosmident"
 
-    # ----- Statut global (🟩/🟦/🟥) -----
     both = df_out.at[i, "Match Desmos"] and df_out.at[i, "Match Cosmident"]
     only_one = df_out.at[i, "Match Desmos"] ^ df_out.at[i, "Match Cosmident"]
     if both:
@@ -440,21 +540,19 @@ cos_orphans = []
 if not df_cos.empty:
     for _, r in df_cos.iterrows():
         pname_cos = str(r["Patient"])
-        # Cherche une correspondance dans Résultat ET/OU Desmos
-        m_res = best_match_row(pname_cos, index_res, threshold=0.75)
-        m_des = best_match_row(pname_cos, index_des, threshold=0.75)
-        # Si AUCUNE correspondance (ni Résultat, ni Desmos) → orphelin Cosmident
+        m_res = best_match_row(pname_cos, index_res)
+        m_des = best_match_row(pname_cos, index_des)
         if m_res is None and m_des is None:
             cos_orphans.append({
                 "Patient": pname_cos,
-                "Dent": "",            # pas d’info dent dans Cosmident
-                "Code": "",            # pas d’info code dans Cosmident
-                "Acte": "",            # champs Résultat non applicable
-                "Tarif": "",           # champs Résultat non applicable
+                "Dent": "",
+                "Code": "",
+                "Acte": "",
+                "Tarif": "",
                 "Match Desmos": False,
                 "Acte Desmos": "",
                 "Prix Desmos": "",
-                "Match Cosmident": True,   # présent dans Cosmident
+                "Match Cosmident": True,
                 "Acte Cosmident": str(r.get("Acte Cosmident", "")),
                 "Prix Cosmident": str(r.get("Prix Cosmident", "")),
                 "Statut Desmos": "aucun match Desmos",
@@ -462,26 +560,23 @@ if not df_cos.empty:
                 "Statut Global": "🟧 Cosmident sans correspondance"
             })
 
-# Concaténer : orphelins Cosmident (en tête) + tableau classique
 df_final = pd.concat([pd.DataFrame(cos_orphans), df_out], ignore_index=True)
 st.success(f"✅ Matching terminé — {len(df_final)} lignes (dont {len(cos_orphans)} orphelins Cosmident en tête)")
 
 # ==================== 4) MISE EN COULEUR ====================
 def color_row(row):
-    # couleur selon Statut Global
     val = str(row["Statut Global"])
     if val.startswith("🟩"):
         base = "background-color: #c6f6d5;"  # vert clair
     elif val.startswith("🟦"):
         base = "background-color: #cfe8ff;"  # bleu clair
     elif val.startswith("🟧"):
-        base = "background-color: #ffe5b4;"  # orange pâle (orphelins Cosmident)
+        base = "background-color: #ffe5b4;"  # orange pâle
     else:
-        base = "background-color: #ffd6d6;"  # rouge clair (aucun match global)
+        base = "background-color: #ffd6d6;"  # rouge clair
 
     styles = [base] * len(row)
 
-    # surligner colonne Statut Desmos en jaune si "aucun match Desmos"
     if "aucun match Desmos" in str(row.get("Statut Desmos", "")):
         try:
             col_idx = df_final.columns.get_loc("Statut Desmos")
@@ -489,7 +584,6 @@ def color_row(row):
         except Exception:
             pass
 
-    # surligner colonne Statut Cosmident en orangé si "aucun match Cosmident" ou "orphan Cosmident"
     stat_cos = str(row.get("Statut Cosmident", ""))
     if ("aucun match Cosmident" in stat_cos) or ("orphan Cosmident" in stat_cos):
         try:
@@ -541,4 +635,4 @@ st.download_button(
 )
 
 st.divider()
-st.info("Les lignes Cosmident sans correspondance (ni Résultat, ni Desmos) sont affichées en tête du tableau en 🟧 orange.")
+st.info("Matching patient ultra-permissif activé. Exemple: 'LESCURE SELLIER HAUSSEGUY FLORENCE' correspond à 'FLORENCE LESCURE'.")
