@@ -3,15 +3,14 @@
 import streamlit as st
 import pandas as pd
 import re
-from pathlib import Path
 import io
+import unicodedata
+from pathlib import Path
 import fitz  # PyMuPDF
 from PIL import Image
-import pytesseract
-import unicodedata
 
 # ==================== CONFIG & LOGO ====================
-st.set_page_config(page_title="Analyse & Comparaison (Résultat vs Desmos & Cosmident)", page_icon="🔍", layout="wide")
+st.set_page_config(page_title="Gestion + Comparaison Prothèses", page_icon="🦷", layout="wide")
 
 logo_path = Path("logo.png")
 col_logo, col_title = st.columns([1, 4])
@@ -25,12 +24,12 @@ with col_logo:
         )
         st.caption("Logo manquant → place logo.png à la racine de l’app")
 with col_title:
-    st.title("📄 Comparaison des patients")
-    st.caption("Conserve le code existant. Ajouts uniquement pour post-traiter les résultats — Matching sur le nom du patient (tolérant inversions, accents, casse)")
+    st.title("Gestion des Prothèses + Comparaison Cosmident / Desmos")
+    st.caption("Extraction ciblée HBLDxxx, HBMD351, HBLD634 → Matching par patient (tolérant inversion Nom/Prénom, accents, casse)")
 
 st.divider()
 
-# ==================== OUTILS NOM (AJOUT, ne remplace rien) ====================
+# ==================== OUTILS NOM (AJOUT pour matching) ====================
 def strip_accents(s: str) -> str:
     s_norm = unicodedata.normalize("NFD", str(s))
     s_no = "".join(ch for ch in s_norm if unicodedata.category(ch) != "Mn")
@@ -47,47 +46,184 @@ def jaccard(a: set, b: set) -> float:
     inter = len(a & b); union = len(a | b)
     return inter / union if union else 0.0
 
-def names_match(name_a: str, name_b: str, threshold: float = 0.75) -> bool:
-    ta = set(canonical_tokens(name_a)); tb = set(canonical_tokens(name_b))
-    if not ta or not tb: return False
-    if ta == tb: return True
-    return jaccard(ta, tb) >= threshold
+def best_match_row(target_name: str, index: dict, threshold: float = 0.75):
+    tkey = " ".join(canonical_tokens(target_name))
+    if not tkey or not index:
+        return None
+    if tkey in index:
+        return index[tkey][0]
+    best = None; best_score = 0.0
+    tset = set(tkey.split())
+    for k, rows in index.items():
+        score = jaccard(tset, set(k.split()))
+        if score > best_score:
+            best_score = score; best = rows[0]
+    return best if best_score >= threshold else None
 
-# ==================== TES FONCTIONS EXISTANTES (CONSERVÉES) ====================
-# 🔹 Extraction image Cosmident (OCR uniquement si fichier image)
+def make_index(df: pd.DataFrame, col_name: str) -> dict:
+    idx = {}
+    if df is None or df.empty or col_name not in df.columns:
+        return idx
+    for _, r in df.iterrows():
+        key = " ".join(canonical_tokens(str(r[col_name])))
+        if key:
+            idx.setdefault(key, []).append(r)
+    return idx
+
+# ==================== 1) EXTRACTION DES ACTES (TON CODE CONSERVÉ) ====================
+st.subheader("1) Extraction des actes prothétiques (Excel)")
+uploaded_facturation = st.file_uploader("📥 Charge ton fichier Excel de facturation", type=["xls", "xlsx"])
+
+df_result = pd.DataFrame()
+if uploaded_facturation:
+    try:
+        df_raw = pd.read_excel(
+            uploaded_facturation,
+            header=None,
+            engine="openpyxl" if uploaded_facturation.name.endswith(".xlsx") else "xlrd"
+        )
+    except Exception as e:
+        st.error(f"Erreur de lecture du fichier : {e}")
+        st.stop()
+
+    results = []
+    current_patient = None
+
+    for idx, row in df_raw.iterrows():
+        row = row.astype(str).str.strip()
+        values = [str(v).strip() for v in row.tolist()]
+        row_text = " ".join([v for v in values if v and v not in ["nan", "None", ""]])
+
+        # Réinitialisation sur bloc doublon Factures/Avoirs
+        if re.search(r"Factures et Avoirs CENTRE DE SANTÉ DES LAURIERS", row_text, re.I):
+            current_patient = None
+            continue
+
+        # Détection patient
+        if re.search(r"N°\s*Dossier", row_text, re.I):
+            m = re.search(r"([A-ZÉÈÊËÀÂÄÔÖÙÛÜÇ][A-ZÉÈÊËÀÂÄÔÖÙÛÜÇ'\- ]{4,80})\s+N°\s*Dossier", row_text, re.I)
+            if m:
+                current_patient = m.group(1).strip()
+            continue
+
+        # En-têtes à ignorer
+        header_patterns = [
+            r"^DATE[\s:]", r"^N°\s*FACT", r"^DENT\(S\)", r"^ACTE$", r"^HONO", r"^AMO$",
+            r"^TOTAL DES FACTURES", r"^IMPRIMÉ LE"
+        ]
+        if any(re.search(p, row_text.upper()) for p in header_patterns):
+            continue
+
+        # Recherche du code cible
+        code = None
+        code_idx = -1
+        for i, cell in enumerate(values):
+            cell = cell.strip()
+            if cell and (cell.startswith("HBLD") or cell in ["HBMD351", "HBLD634"]):
+                code = cell
+                code_idx = i
+                break
+
+        if not code:
+            continue
+
+        # Ignorer les codes HBLD490 et HBLD045
+        if code in ("HBLD490", "HBLD045"):
+            continue
+
+        # Tarif
+        tarif = "?"
+        for offset in [1, 2]:
+            if code_idx + offset < len(values):
+                val = values[code_idx + offset].replace(" ", "")
+                if re.match(r"^\d{1,6}[,.]?\d{0,2}$", val.replace(",", ".")):
+                    tarif = val.replace(".", ",")
+                    break
+
+        # Dent
+        dent = "?"
+        for i in range(code_idx - 1, max(-1, code_idx - 20), -1):
+            m = re.search(r"\b([1-4]?\d)\b", str(values[i]))
+            if m and 1 <= int(m.group(1)) <= 48:
+                dent = m.group(1).zfill(2)
+                break
+
+        # Description acte
+        acte = "?"
+        for i in range(code_idx - 1, max(-1, code_idx - 30), -1):
+            v = str(values[i]).strip()
+            if v and v not in ["nan", "None", ""]:
+                acte = v
+                break
+
+        if not current_patient:
+            continue
+
+        results.append({
+            "Patient": current_patient,
+            "Dent": dent,
+            "Code": code,
+            "Acte": acte,
+            "Tarif": tarif
+        })
+
+    # AFFICHAGE RÉSULTATS
+    if results:
+        df_result = pd.DataFrame(results)[["Patient", "Dent", "Code", "Acte", "Tarif"]]
+        st.success(f"**{len(df_result)} actes prothétiques extraits !**")
+        st.dataframe(df_result, use_container_width=True, hide_index=True)
+
+        csv = df_result.to_csv(index=False, sep=";", encoding="utf-8-sig")
+        st.download_button(
+            label="⬇️ Télécharger le Résultat (CSV)",
+            data=csv,
+            file_name="Protheses_HBLD_HBMD351_HBLD634.csv",
+            mime="text/csv"
+        )
+    else:
+        st.warning("Aucun acte prothétique trouvé.")
+else:
+    st.info("En attente du fichier Excel de facturation…")
+
+st.divider()
+
+# ==================== 2) EXTRACTIONS COSMIDENT (PDF) & DESMOS (EXCEL) ====================
+st.subheader("2) Charges Cosmident (PDF) et Desmos (Excel) pour la comparaison")
+
+col_b, col_c = st.columns(2)
+with col_b:
+    uploaded_cosmident = st.file_uploader("📥 Cosmident (PDF)", type=["pdf"])
+with col_c:
+    uploaded_desmos = st.file_uploader("📥 Desmos (Excel)", type=["xls", "xlsx"])
+
+# --- Extraction Cosmident (PDF) : conserve ta logique ---
 def extract_text_from_image(image):
-    return pytesseract.image_to_string(image)
+    # OCR optionnel si un jour tu autorises des images
+    try:
+        import pytesseract
+        return pytesseract.image_to_string(image)
+    except Exception:
+        return ""
 
-# 🔹 Extraction Cosmident robuste (CONSERVÉE)
 def extract_data_from_cosmident(file):
     file_bytes = file.read()
-    if file.type == "application/pdf":
-        try:
-            doc = fitz.open(stream=file_bytes, filetype="pdf")
-        except Exception as e:
-            st.error(f"Erreur ouverture PDF : {e}")
-            return pd.DataFrame()
-        full_text = ""
+    full_text = ""
+    try:
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
         for page in doc:
             page_text = page.get_text("text")
-            # Coupe tout ce qui est après les mentions du bas de page
             stop_pattern = r"(COSMIDENT|IBAN|Siret|BIC|Tél\.|Total \(Euros\)|TOTAL TTC|Règlement|Chèque|NOS COORDONNÉES BANCAIRES)"
             page_text = re.split(stop_pattern, page_text, flags=re.IGNORECASE)[0]
             full_text += page_text + "\n"
-    else:
-        # Image: lecture + OCR (optionnel)
-        try:
-            image = Image.open(io.BytesIO(file_bytes))
-            full_text = extract_text_from_image(image)
-        except Exception as e:
-            st.error(f"Erreur lecture image : {e}")
-            return pd.DataFrame()
+    except Exception as e:
+        st.error(f"Erreur ouverture PDF Cosmident : {e}")
+        return pd.DataFrame()
 
     # Aperçu debug
-    with st.expander("🧩 Aperçu du texte extrait (Cosmident brut)"):
+    with st.expander("🧩 Aperçu du texte extrait (Cosmident brut)", expanded=False):
         st.write(full_text[:2000])
 
-    # Nettoyage du texte
+    # Nettoyage
     lines = full_text.split("\n")
     clean_lines = []
     for line in lines:
@@ -110,73 +246,41 @@ def extract_data_from_cosmident(file):
         line = clean_lines[i]
         i += 1
 
-        # Détection robuste du patient
-        ref_match = re.search(
-            r"Ref\.?\s*(?:Patient\s*)?:?\s*([\w\s\-'’]+)",
-            line,
-            re.IGNORECASE,
-        )
+        # Ref Patient
+        ref_match = re.search(r"Ref\.?\s*(?:Patient\s*)?:?\s*([\w\s\-'’]+)", line, re.IGNORECASE)
         if ref_match:
-            # Append previous act if any
-            if current_patient and current_description and len(current_numbers) > 0:
+            if current_patient and current_description and current_numbers:
                 try:
                     total = float(str(current_numbers[-1]).replace(",", "."))
                     if total > 0:
                         results.append({
-                            "Patient": current_patient,
+                            "Patient": current_patient.strip(),
                             "Acte Cosmident": current_description.strip(),
                             "Prix Cosmident": f"{total:.2f}",
                         })
                 except ValueError:
                     pass
+            current_patient = ref_match.group(1).strip()
             current_description = ""
             current_numbers = []
-            current_patient = ref_match.group(1).strip()
             continue
 
-        # Bon n° ... Prescription (cas particulier)
-        bon_match = re.match(r"Bon n°\d+ du [\w\d/]+.*Prescription \d+", line)
-        if bon_match and i < len(clean_lines):
-            next_line = clean_lines[i].strip()
-            ref_match = re.search(
-                r"Ref\.?\s*(?:Patient\s*)?:?\s*([\w\s\-'’]+)",
-                next_line,
-                re.IGNORECASE,
-            )
-            if ref_match:
-                if current_patient and current_description and len(current_numbers) > 0:
-                    try:
-                        total = float(str(current_numbers[-1]).replace(",", "."))
-                        if total > 0:
-                            results.append({
-                                "Patient": current_patient,
-                                "Acte Cosmident": current_description.strip(),
-                                "Prix Cosmident": f"{total:.2f}",
-                            })
-                    except ValueError:
-                        pass
-                current_description = ""
-                current_numbers = []
-                current_patient = ref_match.group(1).strip()
-                i += 1
-                continue
-
+        # Ignorer tant qu'on n'a pas un patient
         if current_patient is None:
             continue
 
-        # Nombres (prix)
+        # Nombres/prix
         this_numbers = re.findall(r"\d+[\.,]\d{2}", line)
         norm_numbers = [n.replace(",", ".") for n in this_numbers]
-        # Texte (sans nombres)
         this_text = re.sub(r"\s*\d+[\.,]\d{2}\s*", " ", line).strip()
 
         if this_text:
-            if current_description and len(current_numbers) > 0:
+            if current_description and current_numbers:
                 try:
                     total = float(str(current_numbers[-1]).replace(",", "."))
                     if total > 0:
                         results.append({
-                            "Patient": current_patient,
+                            "Patient": current_patient.strip(),
                             "Acte Cosmident": current_description.strip(),
                             "Prix Cosmident": f"{total:.2f}",
                         })
@@ -184,18 +288,18 @@ def extract_data_from_cosmident(file):
                     pass
                 current_description = ""
                 current_numbers = []
-            current_description = this_text if not current_description else (current_description + " " + this_text)
+            current_description = (current_description + " " + this_text).strip()
 
         if norm_numbers:
             current_numbers.extend(norm_numbers)
 
-    # Append last act
-    if current_patient and current_description and len(current_numbers) > 0:
+    # Dernier acte
+    if current_patient and current_description and current_numbers:
         try:
             total = float(str(current_numbers[-1]).replace(",", "."))
             if total > 0:
                 results.append({
-                    "Patient": current_patient,
+                    "Patient": current_patient.strip(),
                     "Acte Cosmident": current_description.strip(),
                     "Prix Cosmident": f"{total:.2f}",
                 })
@@ -207,55 +311,8 @@ def extract_data_from_cosmident(file):
         df = df.drop_duplicates(subset=["Patient", "Acte Cosmident", "Prix Cosmident"])
     return df
 
-# 🔹 Extraction Desmos (PDF) — CONSERVÉE telle quelle
-def extract_desmos_acts(file):
-    doc = fitz.open(stream=file.read(), filetype="pdf")
-    full_text = ""
-    for page in doc:
-        full_text += page.get_text() + "\n"
-    lines = full_text.split("\n")
-    data = []
-    current_patient = None
-    current_acte = ""
-    current_hono = ""
-    for idx, line in enumerate(lines):
-        patient_match = re.search(
-            r"Ref\. ([A-ZÉÈÇÂÊÎÔÛÄËÏÖÜÀÙa-zéèçâêîôûäëïöüàù\s\-]+)",
-            line
-        )
-        if patient_match:
-            if current_patient and current_acte and current_hono:
-                data.append({
-                    "Patient": current_patient,
-                    "Acte Desmos": current_acte.strip(),
-                    "Prix Desmos": current_hono,
-                })
-            current_patient = patient_match.group(1).strip()
-            current_acte = ""
-            current_hono = ""
-        elif re.search(
-            r"(BIOTECH|Couronne transvissée|HBL\w+|ZIRCONE|GOUTTIÈRE SOUPLE|EMAX|ONLAY|PLAQUE|ADJONCTION|MONTAGE|DENT RESINE)",
-            line, re.IGNORECASE,
-        ):
-            current_acte = line.strip()
-            current_hono = ""
-        elif "Hono" in line:
-            hono_match = re.search(r"Hono\.?\s*:?\s*([\d,\.]+)", line)
-            if hono_match:
-                current_hono = hono_match.group(1).replace(",", ".")
-        elif current_acte and re.match(r"^\d+[\.,]\d{2}$", line):
-            current_hono = line.replace(",", ".")
-    if current_patient and current_acte and current_hono:
-        data.append({
-            "Patient": current_patient,
-            "Acte Desmos": current_acte.strip(),
-            "Prix Desmos": current_hono,
-        })
-    return pd.DataFrame(data)
-
-# ==================== LECTURE DESMOS EXCEL (AJOUT) ====================
+# --- Lecture Desmos (Excel) ---
 def read_desmos_excel(file) -> pd.DataFrame:
-    """Lit l'Excel Desmos et tente de détecter Patient / Acte / Prix. Ne remplace pas la fonction PDF existante."""
     try:
         df = pd.read_excel(
             file,
@@ -266,7 +323,6 @@ def read_desmos_excel(file) -> pd.DataFrame:
         st.error(f"Erreur de lecture Desmos (Excel) : {e}")
         return pd.DataFrame()
 
-    # normalisation légère des noms de colonnes
     df.columns = [str(c).strip() for c in df.columns]
 
     def pick(keywords):
@@ -288,126 +344,55 @@ def read_desmos_excel(file) -> pd.DataFrame:
             .str.replace(",", ".")
             .str.extract(r"(\d+(?:\.\d{1,2})?)", expand=False)
         )
-
     return df
 
-# ==================== CHARGEMENT FICHIERS ====================
-st.subheader("1) Charge les fichiers")
-col_a, col_b, col_c = st.columns(3)
+df_cos = pd.DataFrame()
+df_des = pd.DataFrame()
 
-with col_a:
-    uploaded_result = st.file_uploader("📥 Tableau Résultat (CSV ou Excel) — Patient/Dent/Code/Acte/Tarif", type=["csv", "xls", "xlsx"])
-with col_b:
-    uploaded_desmos = st.file_uploader("📥 Desmos (Excel recommandé)", type=["xls", "xlsx", "pdf"])
-with col_c:
-    uploaded_cosmident = st.file_uploader("📥 Cosmident (PDF)", type=["pdf"])
-
-if not uploaded_result:
-    st.info("➡️ Charge d’abord le tableau Résultat (CSV/Excel) issu de ton extraction HBLD/HBMD351/HBLD634.")
-    st.stop()
-
-# Lire tableau Résultat (ne pas ré-extraire, on utilise ce qui a été produit)
-try:
-    if uploaded_result.name.lower().endswith(".csv"):
-        df_result = pd.read_csv(uploaded_result, sep=";", encoding="utf-8-sig")
-    else:
-        df_result = pd.read_excel(
-            uploaded_result,
-            header=0,
-            engine="openpyxl" if uploaded_result.name.endswith(".xlsx") else "xlrd"
-        )
-except Exception as e:
-    st.error(f"Erreur de lecture du tableau Résultat : {e}")
-    st.stop()
-
-if "Patient" not in df_result.columns:
-    # fallback: laisser choisir la colonne Patient
-    st.warning("La colonne 'Patient' n’a pas été trouvée. Sélectionne-la ci-dessous.")
-    sel = st.selectbox("Colonne à utiliser comme Patient", options=df_result.columns.tolist())
-    df_result = df_result.rename(columns={sel: "Patient"})
-
-st.success(f"✔ Résultat chargé — {len(df_result)} lignes")
-with st.expander("Voir le tableau Résultat"):
-    st.dataframe(df_result, use_container_width=True, hide_index=True)
-
-# ==================== EXTRACTIONS SECONDAIRES ====================
-# Cosmident
-df_cosmident = pd.DataFrame()
 if uploaded_cosmident:
     uploaded_cosmident.seek(0)
-    df_cosmident = extract_data_from_cosmident(uploaded_cosmident)
-    if df_cosmident.empty:
+    df_cos = extract_data_from_cosmident(uploaded_cosmident)
+    if df_cos.empty:
         st.warning("Cosmident : aucune ligne extraite.")
     else:
-        st.success(f"✔ Cosmident (PDF) extrait — {len(df_cosmident)} lignes")
-        st.dataframe(df_cosmident, use_container_width=True, hide_index=True)
+        st.success(f"✔ Cosmident (PDF) extrait — {len(df_cos)} lignes")
+        st.dataframe(df_cos, use_container_width=True, hide_index=True)
 
-# Desmos (PDF conservé + Excel ajouté)
-df_desmos = pd.DataFrame()
 if uploaded_desmos:
     uploaded_desmos.seek(0)
-    is_excel = str(getattr(uploaded_desmos, "name", "")).lower().endswith((".xls", ".xlsx"))
-    if is_excel:
-        df_desmos = read_desmos_excel(uploaded_desmos)
-        if df_desmos.empty or "Patient" not in df_desmos.columns:
-            st.warning("Desmos Excel : colonnes Patient/Acte/Prix non détectées automatiquement.")
-            st.dataframe(df_desmos, use_container_width=True, hide_index=True)
-            # Sélecteurs manuels
-            cols = df_desmos.columns.tolist()
-            if cols:
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    pcol = st.selectbox("Colonne Patient (Desmos)", options=cols)
-                with col2:
-                    acol = st.selectbox("Colonne Acte (Desmos)", options=cols)
-                with col3:
-                    prcol = st.selectbox("Colonne Prix (Desmos)", options=cols)
-                df_desmos = df_desmos[[pcol, acol, prcol]].copy()
-                df_desmos.columns = ["Patient", "Acte Desmos", "Prix Desmos"]
-                df_desmos["Prix Desmos"] = (
-                    df_desmos["Prix Desmos"].astype(str)
-                    .str.replace(",", ".")
-                    .str.extract(r"(\d+(?:\.\d{1,2})?)", expand=False)
-                )
-        st.success(f"✔ Desmos (Excel) chargé — {len(df_desmos)} lignes")
-        st.dataframe(df_desmos, use_container_width=True, hide_index=True)
+    df_des = read_desmos_excel(uploaded_desmos)
+    if df_des.empty:
+        st.warning("Desmos : fichier lu mais colonnes Patient/Acte/Prix non détectées automatiquement.")
+        st.dataframe(df_des, use_container_width=True, hide_index=True)
+        if not df_des.empty:
+            cols = df_des.columns.tolist()
+            col1, col2, col3 = st.columns(3)
+            with col1: pcol = st.selectbox("Colonne Patient (Desmos)", options=cols)
+            with col2: acol = st.selectbox("Colonne Acte (Desmos)", options=cols)
+            with col3: prcol = st.selectbox("Colonne Prix (Desmos)", options=cols)
+            df_des = df_des[[pcol, acol, prcol]].copy()
+            df_des.columns = ["Patient", "Acte Desmos", "Prix Desmos"]
+            df_des["Prix Desmos"] = (
+                df_des["Prix Desmos"].astype(str)
+                .str.replace(",", ".")
+                .str.extract(r"(\d+(?:\.\d{1,2})?)", expand=False)
+            )
     else:
-        # Conserver ta fonction PDF
-        df_desmos = extract_desmos_acts(uploaded_desmos)
-        st.success(f"✔ Desmos (PDF) extrait — {len(df_desmos)} lignes")
-        st.dataframe(df_desmos, use_container_width=True, hide_index=True)
+        st.success(f"✔ Desmos (Excel) chargé — {len(df_des)} lignes")
+        st.dataframe(df_des, use_container_width=True, hide_index=True)
 
-# ==================== MATCHING (POST-TRAITEMENT AJOUT) ====================
-st.subheader("2) Matching des Patients (nom uniquement)")
-st.caption("Tolérant aux accents, majuscules/minuscules, inversions Nom/Prénom, petites variations — seuil Jaccard: 0.75")
+st.divider()
 
-def make_index(df: pd.DataFrame, col_name: str) -> dict:
-    idx = {}
-    if df is None or df.empty or col_name not in df.columns:
-        return idx
-    for _, r in df.iterrows():
-        key = " ".join(canonical_tokens(str(r[col_name])))
-        if key:
-            idx.setdefault(key, []).append(r)
-    return idx
+# ==================== 3) MATCHING AUTOMATIQUE (sur df_result produit au §1) ====================
+st.subheader("3) Matching par Patient (Résultat vs Cosmident/Desmos)")
+
+if df_result.empty:
+    st.info("⚠️ Le tableau Résultat n’est pas encore disponible. Charge l’Excel de facturation au §1.")
+    st.stop()
 
 index_res = make_index(df_result, "Patient")
-index_des = make_index(df_desmos, "Patient") if not df_desmos.empty else {}
-index_cos = make_index(df_cosmident, "Patient") if not df_cosmident.empty else {}
-
-def best_match_row(target_name: str, index: dict, threshold: float = 0.75):
-    tkey = " ".join(canonical_tokens(target_name))
-    if not tkey or not index:
-        return None
-    if tkey in index:
-        return index[tkey][0]
-    best = None; best_score = 0.0
-    tset = set(tkey.split())
-    for k, rows in index.items():
-        score = jaccard(tset, set(k.split()))
-        if score > best_score:
-            best_score = score; best = rows[0]
-    return best if best_score >= threshold else None
+index_des = make_index(df_des, "Patient") if not df_des.empty else {}
+index_cos = make_index(df_cos, "Patient") if not df_cos.empty else {}
 
 df_out = df_result.copy()
 df_out["Match Desmos"] = False
@@ -421,14 +406,14 @@ for i, row in df_out.iterrows():
     pname = str(row["Patient"])
 
     # Desmos
-    r_des = best_match_row(pname, index_des)
+    r_des = best_match_row(pname, index_des, threshold=0.75)
     if r_des is not None:
         df_out.at[i, "Match Desmos"] = True
         df_out.at[i, "Acte Desmos"] = str(r_des.get("Acte Desmos", ""))
         df_out.at[i, "Prix Desmos"] = str(r_des.get("Prix Desmos", ""))
 
     # Cosmident
-    r_cos = best_match_row(pname, index_cos)
+    r_cos = best_match_row(pname, index_cos, threshold=0.75)
     if r_cos is not None:
         df_out.at[i, "Match Cosmident"] = True
         df_out.at[i, "Acte Cosmident"] = str(r_cos.get("Acte Cosmident", ""))
@@ -436,7 +421,7 @@ for i, row in df_out.iterrows():
 
 st.success(f"✅ Matching terminé — {len(df_out)} lignes")
 
-# ==================== MISE EN COULEUR ====================
+# ==================== 4) MISE EN COULEUR ====================
 def color_row(row):
     both = row["Match Desmos"] and row["Match Cosmident"]
     only_one = row["Match Desmos"] ^ row["Match Cosmident"]
@@ -450,12 +435,11 @@ def color_row(row):
     return [base] * len(row)
 
 styled = df_out.style.apply(color_row, axis=1)
-
-st.subheader("3) Tableau comparé et coloré")
+st.subheader("4) Tableau comparé et coloré")
 st.caption("🟩 match Desmos + Cosmident | 🟦 match d’un seul | 🟥 aucun match")
 st.dataframe(styled, use_container_width=True, hide_index=True)
 
-# ==================== TÉLÉCHARGEMENT ====================
+# ==================== 5) TÉLÉCHARGEMENT ====================
 csv_out = df_out.to_csv(index=False, sep=";", encoding="utf-8-sig")
 st.download_button(
     label="⬇️ Télécharger le tableau fusionné (CSV)",
@@ -465,4 +449,4 @@ st.download_button(
 )
 
 st.divider()
-st.info("Astuce : si Desmos Excel a des colonnes atypiques, utilise les sélecteurs pour préciser Patient/Acte/Prix. Le matching ne dépend que du nom du patient.")
+st.info("Le Résultat est généré automatiquement à partir de l’Excel de facturation (§1). Aucune charge manuelle des résultats n’est requise.")
