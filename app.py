@@ -31,7 +31,7 @@ else:
     st.caption("Logo manquant → place logo.png à la racine de l’app")
 
 st.title("Gestion des Prothèses — Desmos (Excel) + Cosmident (PDF)")
-st.caption("Comparaison **uniquement** sur le nom du patient (normalisation + option floue). Ajout des colonnes Cosmident (Acte, €).")
+st.caption("Comparaison **uniquement** sur le nom du patient (normalisation + fuzzy). Ajout des colonnes Cosmident (Acte, €).")
 
 # ==================== SIDEBAR PARAMS ====================
 with st.sidebar:
@@ -63,6 +63,7 @@ with st.sidebar:
     st.caption("Correspondance par patient (uniquement)")
     use_fuzzy = st.checkbox("Activer la correspondance floue", value=True)
     fuzzy_threshold = st.slider("Seuil de similarité (0–100)", min_value=50, max_value=100, value=85, step=1)
+    show_candidates = st.checkbox("Afficher les meilleurs candidats (pour les non appariés)", value=True)
 
     st.markdown("---")
     search_text = st.text_input("Recherche plein texte (toutes colonnes)", "")
@@ -75,22 +76,31 @@ with col_up2:
     cosmi_pdf = st.file_uploader("PDF Cosmident", type=["pdf"], key="cosmi_pdf")
 
 # ==================== UTILITAIRES ====================
+def _normalize_spaces(s: str) -> str:
+    # remplace NBSP & co par espace normal
+    return s.replace("\u00A0", " ").replace("\u2009", " ")
+
 def normalize_patient(name: str) -> str:
     """
     Normalise le nom patient pour une comparaison robuste :
     - supprime accents
     - met en MAJ
-    - supprime ponctuation, double espaces
+    - remplace ponctuation/traits/apostrophes par espaces
+    - nettoie espaces (y compris NBSP)
     - découpe en tokens et les trie (gère inversion NOM/PRÉNOM)
     """
     if not isinstance(name, str):
         name = str(name) if name is not None else ""
+    name = _normalize_spaces(name)
     # accents -> ascii
     name = unicodedata.normalize("NFD", name)
     name = "".join(ch for ch in name if unicodedata.category(ch) != "Mn")
-    # maj, ponctuation -> espaces
+    # maj
     name = name.upper()
+    # ponctuation/numériques -> espaces
     name = re.sub(r"[^A-Z ]", " ", name)
+    # espaces multiples -> un seul
+    name = re.sub(r"\s+", " ", name).strip()
     # tokens -> tri (gère 'DUVAL ERIC' == 'ERIC DUVAL')
     tokens = [t for t in name.split() if t]
     tokens.sort()
@@ -504,10 +514,22 @@ def build_cosmident_agg_by_patient(df_cos: pd.DataFrame, strategy: str) -> pd.Da
     return df_cos_agg
 
 # ==================== Fuzzy matching (par patient) ====================
-def fuzzy_match_patients(des_keys, cos_keys, threshold=85):
+def fuzzy_score(a: str, b: str) -> int:
+    """Score de similarité 0..100 (max de plusieurs métriques si RapidFuzz dispo)."""
+    if RF_AVAILABLE:
+        return max(
+            fuzz.token_sort_ratio(a, b),
+            fuzz.token_set_ratio(a, b),
+            fuzz.partial_ratio(a, b),
+            fuzz.ratio(a, b)
+        )
+    # fallback difflib
+    return int(difflib.SequenceMatcher(None, a, b).ratio() * 100)
+
+def fuzzy_match_patients(des_keys, cos_keys, threshold=85, limit=3):
     """
-    Retourne un dict {des_key: matched_cos_key or None} + DataFrame des scores.
-    Utilise RapidFuzz si disponible, sinon difflib.
+    mapping: {des_key: matched_cos_key or None}
+    df_candidates: meilleurs candidats pour chaque des_key (jusqu'à 'limit')
     """
     mapping = {}
     rows = []
@@ -517,8 +539,9 @@ def fuzzy_match_patients(des_keys, cos_keys, threshold=85):
         best_key = None
         best_score = 0
 
+        # 1) meilleur unique
         if RF_AVAILABLE:
-            match = process.extractOne(dk, cos_list, scorer=fuzz.token_sort_ratio)
+            match = process.extractOne(dk, cos_list, scorer=fuzz.token_set_ratio)
             if match:
                 best_key, best_score, _ = match
         else:
@@ -527,15 +550,21 @@ def fuzzy_match_patients(des_keys, cos_keys, threshold=85):
                 best_key = match[0]
                 best_score = int(difflib.SequenceMatcher(None, dk, best_key).ratio() * 100)
 
-        if best_score >= threshold:
-            mapping[dk] = best_key
+        mapping[dk] = best_key if best_score >= threshold else None
+
+        # 2) top candidats (pour debug UI)
+        if RF_AVAILABLE:
+            cand_list = process.extract(dk, cos_list, scorer=fuzz.token_set_ratio, limit=limit)
+            for cand, score, _ in cand_list:
+                rows.append({"Patient_norm_Desmos": dk, "Candidat_Cosmi": cand, "Score": score})
         else:
-            mapping[dk] = None
+            cand_list = difflib.get_close_matches(dk, cos_list, n=limit, cutoff=0.0)
+            for cand in cand_list:
+                s = int(difflib.SequenceMatcher(None, dk, cand).ratio() * 100)
+                rows.append({"Patient_norm_Desmos": dk, "Candidat_Cosmi": cand, "Score": s})
 
-        rows.append({"Patient_norm_Desmos": dk, "Match_Cosmi": best_key or "", "Score": best_score})
-
-    df_scores = pd.DataFrame(rows).sort_values(by="Score", ascending=False)
-    return mapping, df_scores
+    df_candidates = pd.DataFrame(rows).sort_values(["Patient_norm_Desmos", "Score"], ascending=[True, False])
+    return mapping, df_candidates
 
 # ==================== PIPELINE ====================
 if desmos_file and cosmi_pdf:
@@ -577,11 +606,11 @@ if desmos_file and cosmi_pdf:
     df_merge["Cosmident_match_exact"] = df_merge["Acte_Cosmident"].notna()
 
     # --- Correspondance floue (optionnel) ---
-    df_scores = pd.DataFrame(columns=["Patient_norm_Desmos", "Match_Cosmi", "Score"])
+    df_candidates = pd.DataFrame(columns=["Patient_norm_Desmos", "Candidat_Cosmi", "Score"])
     if use_fuzzy and not df_cos_agg.empty:
         des_keys = df_des["Patient_norm"].unique().tolist()
         cos_keys = df_cos_agg["Patient_norm"].unique().tolist()
-        mapping, df_scores = fuzzy_match_patients(des_keys, cos_keys, threshold=fuzzy_threshold)
+        mapping, df_candidates = fuzzy_match_patients(des_keys, cos_keys, threshold=fuzzy_threshold, limit=3)
 
         # Applique mapping uniquement pour ceux sans match exact
         no_exact_mask = ~df_merge["Cosmident_match_exact"]
@@ -594,6 +623,9 @@ if desmos_file and cosmi_pdf:
         })
 
         df_no_exact = df_no_exact.merge(df_map, on="Patient_norm", how="left")
+
+        # Filtrer uniquement les lignes où un candidat est proposé (non-None)
+        df_no_exact = df_no_exact[df_no_exact["Cosmident_norm_mapped"].notna()].copy()
 
         # Merge flou vers agg Cosmident
         df_no_exact = df_no_exact.merge(
@@ -608,7 +640,7 @@ if desmos_file and cosmi_pdf:
             df_no_exact[col] = df_no_exact[col].fillna(df_no_exact[f"{col}_fuzzy"])
 
         # Re-intègre dans df_merge
-        df_merge.loc[no_exact_mask, ["Acte_Cosmident", "Tarif_Cosmident", "Nb_actes_Cosmi"]] = \
+        df_merge.loc[df_no_exact.index, ["Acte_Cosmident", "Tarif_Cosmident", "Nb_actes_Cosmi"]] = \
             df_no_exact[["Acte_Cosmident", "Tarif_Cosmident", "Nb_actes_Cosmi"]].values
 
     # --- Indicateur final de match (exact ou flou) ---
@@ -630,17 +662,84 @@ if desmos_file and cosmi_pdf:
     st.success(f"**{len(df_merge)} actes rapprochés (jointure par NOM PATIENT)**")
     st.dataframe(df_merge[affichage_cols], use_container_width=True, hide_index=True)
 
-    # --- Tableau des scores (si fuzzy activé) ---
-    if use_fuzzy and not df_scores.empty:
-        st.subheader("Scores de correspondance floue (par patient normalisé)")
-        st.caption("Token-sort ratio (RapidFuzz si disponible, sinon approximation via difflib).")
-        st.dataframe(df_scores, use_container_width=True, hide_index=True)
+    # --- Meilleurs candidats pour les non appariés ---
+    if use_fuzzy and show_candidates and not df_candidates.empty:
+        # Conserver uniquement les patients Desmos sans match final
+        unmatched = df_merge.loc[~df_merge["Cosmident_match"], "Patient_norm"].unique().tolist()
+        df_show = df_candidates[df_candidates["Patient_norm_Desmos"].isin(unmatched)].copy()
+        if not df_show.empty:
+            st.subheader("Candidats Cosmident pour patients non appariés")
+            st.caption("Tri par score décroissant — valide automatiquement si le seuil est atteint.")
+            st.dataframe(df_show, use_container_width=True, hide_index=True)
 
     # --- Export CSV ---
     csv = df_merge[affichage_cols].to_csv(index=False, sep=";", encoding="utf-8-sig")
     st.download_button("Télécharger le CSV", data=csv, file_name="Protheses_Desmos_Cosmident_byPatient.csv", mime="text/csv")
 
     # --- Export Excel (avec fallback moteur) ---
+    def _pick_excel_engine():
+        try:
+            import xlsxwriter  # noqa: F401
+            return "xlsxwriter"
+        except Exception:
+            pass
+        try:
+            import openpyxl  # noqa: F401
+            return "openpyxl"
+        except Exception:
+            pass
+        return None
+
+    def style_dataframe_to_excel(df: pd.DataFrame, money_columns=None, sheet_name="Actes") -> BytesIO | None:
+        engine = _pick_excel_engine()
+        if engine is None:
+            return None
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine=engine) as writer:
+            df.to_excel(writer, index=False, sheet_name=sheet_name)
+            if engine == "xlsxwriter":
+                workbook  = writer.book
+                worksheet = writer.sheets[sheet_name]
+                header_fmt = workbook.add_format({"bold": True, "font_color": "white", "bg_color": "#1F4E79", "align": "center", "valign": "vcenter"})
+                money_fmt = workbook.add_format({"num_format": u'€ #,##0.00'})
+                for col_idx, col_name in enumerate(df.columns):
+                    worksheet.write(0, col_idx, col_name, header_fmt)
+                worksheet.autofilter(0, 0, len(df), len(df.columns) - 1)
+                for col_idx, col_name in enumerate(df.columns):
+                    max_len = max([len(str(col_name))] + [len(str(v)) if v is not None else 0 for v in df[col_name].tolist()])
+                    worksheet.set_column(col_idx, col_idx, min(max_len + 2, 60))
+                if money_columns:
+                    for col_name in money_columns:
+                        if col_name in df.columns:
+                            col_idx = df.columns.get_loc(col_name)
+                            worksheet.set_column(col_idx, col_idx, None, money_fmt)
+        output.seek(0)
+        return output
+
+    def style_summary_to_excel(df_sum: pd.DataFrame, sheet_name="Récap") -> BytesIO | None:
+        engine = _pick_excel_engine()
+        if engine is None:
+            return None
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine=engine) as writer:
+            df_sum.to_excel(writer, index=False, sheet_name=sheet_name)
+            if engine == "xlsxwriter":
+                workbook  = writer.book
+                worksheet = writer.sheets[sheet_name]
+                header_fmt = workbook.add_format({"bold": True, "font_color": "white", "bg_color": "#2F528F", "align": "center", "valign": "vcenter"})
+                money_fmt = workbook.add_format({"num_format": u'€ #,##0.00'})
+                for col_idx, col_name in enumerate(df_sum.columns):
+                    worksheet.write(0, col_idx, col_name, header_fmt)
+                worksheet.autofilter(0, 0, len(df_sum), len(df_sum.columns) - 1)
+                for col_idx, col_name in enumerate(df_sum.columns):
+                    max_len = max([len(str(col_name))] + [len(str(v)) if v is not None else 0 for v in df_sum[col_name].tolist()])
+                    worksheet.set_column(col_idx, col_idx, min(max_len + 2, 50))
+                if "Total (€)" in df_sum.columns:
+                    col_idx = df_sum.columns.get_loc("Total (€)")
+                    worksheet.set_column(col_idx, col_idx, None, money_fmt)
+        output.seek(0)
+        return output
+
     xls = style_dataframe_to_excel(df_merge[affichage_cols], money_columns=["Tarif", "Tarif_Cosmident"], sheet_name="Actes rapprochés (par patient)")
     if xls is not None:
         st.download_button("Télécharger l'Excel (.xlsx)", data=xls, file_name="Protheses_Desmos_Cosmident_byPatient.xlsx",
