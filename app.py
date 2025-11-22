@@ -70,7 +70,7 @@ def make_index(df: pd.DataFrame, col_name: str) -> dict:
             idx.setdefault(key, []).append(r)
     return idx
 
-# ==================== 1) EXTRACTION DES ACTES (ton code conservé) ====================
+# ==================== 1) EXTRACTION DES ACTES (Excel facturation) ====================
 st.subheader("1) Extraction des actes prothétiques (Excel de facturation)")
 uploaded_facturation = st.file_uploader("📥 Charge le fichier Excel (facturation)", type=["xls", "xlsx"])
 
@@ -400,7 +400,7 @@ df_out["Prix Cosmident"] = ""
 # Statuts détaillés
 df_out["Statut Desmos"] = ""       # "match" ou "aucun match Desmos"
 df_out["Statut Cosmident"] = ""    # "match" ou "aucun match Cosmident"
-df_out["Statut Global"] = ""       # 🟩 / 🟦 / 🟥
+df_out["Statut Global"] = ""       # 🟩 / 🟦 / 🟥 / 🟧
 
 for i, row in df_out.iterrows():
     pname = str(row["Patient"])
@@ -425,7 +425,7 @@ for i, row in df_out.iterrows():
     else:
         df_out.at[i, "Statut Cosmident"] = "aucun match Cosmident"
 
-    # ----- Statut global -----
+    # ----- Statut global (🟩/🟦/🟥) -----
     both = df_out.at[i, "Match Desmos"] and df_out.at[i, "Match Cosmident"]
     only_one = df_out.at[i, "Match Desmos"] ^ df_out.at[i, "Match Cosmident"]
     if both:
@@ -435,62 +435,104 @@ for i, row in df_out.iterrows():
     else:
         df_out.at[i, "Statut Global"] = "🟥 aucun match"
 
-st.success(f"✅ Matching terminé — {len(df_out)} lignes")
+# ==================== 3bis) PRÉFIXE : ORPHELINS COSMIDENT (en orange) ====================
+cos_orphans = []
+if not df_cos.empty:
+    for _, r in df_cos.iterrows():
+        pname_cos = str(r["Patient"])
+        # Cherche une correspondance dans Résultat ET/OU Desmos
+        m_res = best_match_row(pname_cos, index_res, threshold=0.75)
+        m_des = best_match_row(pname_cos, index_des, threshold=0.75)
+        # Si AUCUNE correspondance (ni Résultat, ni Desmos) → orphelin Cosmident
+        if m_res is None and m_des is None:
+            cos_orphans.append({
+                "Patient": pname_cos,
+                "Dent": "",            # pas d’info dent dans Cosmident
+                "Code": "",            # pas d’info code dans Cosmident
+                "Acte": "",            # champs Résultat non applicable
+                "Tarif": "",           # champs Résultat non applicable
+                "Match Desmos": False,
+                "Acte Desmos": "",
+                "Prix Desmos": "",
+                "Match Cosmident": True,   # présent dans Cosmident
+                "Acte Cosmident": str(r.get("Acte Cosmident", "")),
+                "Prix Cosmident": str(r.get("Prix Cosmident", "")),
+                "Statut Desmos": "aucun match Desmos",
+                "Statut Cosmident": "orphan Cosmident",
+                "Statut Global": "🟧 Cosmident sans correspondance"
+            })
+
+# Concaténer : orphelins Cosmident (en tête) + tableau classique
+df_final = pd.concat([pd.DataFrame(cos_orphans), df_out], ignore_index=True)
+st.success(f"✅ Matching terminé — {len(df_final)} lignes (dont {len(cos_orphans)} orphelins Cosmident en tête)")
 
 # ==================== 4) MISE EN COULEUR ====================
 def color_row(row):
     # couleur selon Statut Global
-    val = row["Statut Global"]
+    val = str(row["Statut Global"])
     if val.startswith("🟩"):
         base = "background-color: #c6f6d5;"  # vert clair
     elif val.startswith("🟦"):
         base = "background-color: #cfe8ff;"  # bleu clair
+    elif val.startswith("🟧"):
+        base = "background-color: #ffe5b4;"  # orange pâle (orphelins Cosmident)
     else:
-        base = "background-color: #ffd6d6;"  # rouge clair
+        base = "background-color: #ffd6d6;"  # rouge clair (aucun match global)
 
     styles = [base] * len(row)
 
     # surligner colonne Statut Desmos en jaune si "aucun match Desmos"
-    if "aucun match Desmos" in str(row["Statut Desmos"]):
-        col_idx = df_out.columns.get_loc("Statut Desmos")
-        styles[col_idx] = "background-color: #fff3cd;"  # jaune pâle
+    if "aucun match Desmos" in str(row.get("Statut Desmos", "")):
+        try:
+            col_idx = df_final.columns.get_loc("Statut Desmos")
+            styles[col_idx] = "background-color: #fff3cd;"  # jaune pâle
+        except Exception:
+            pass
 
-    # surligner colonne Statut Cosmident en orangé si "aucun match Cosmident"
-    if "aucun match Cosmident" in str(row["Statut Cosmident"]):
-        col_idx = df_out.columns.get_loc("Statut Cosmident")
-        styles[col_idx] = "background-color: #ffe5b4;"  # orange pâle
+    # surligner colonne Statut Cosmident en orangé si "aucun match Cosmident" ou "orphan Cosmident"
+    stat_cos = str(row.get("Statut Cosmident", ""))
+    if ("aucun match Cosmident" in stat_cos) or ("orphan Cosmident" in stat_cos):
+        try:
+            col_idx = df_final.columns.get_loc("Statut Cosmident")
+            styles[col_idx] = "background-color: #ffe5b4;"  # orange pâle
+        except Exception:
+            pass
 
     return styles
 
-styled = df_out.style.apply(color_row, axis=1)
+styled = df_final.style.apply(color_row, axis=1)
 
 st.subheader("4) Tableau comparé et coloré")
-st.caption("🟩 match Desmos + Cosmident | 🟦 match d’un seul | 🟥 aucun match — avec indicateurs 'aucun match Desmos' et 'aucun match Cosmident'")
+st.caption("🟩 match Desmos + Cosmident | 🟦 match d’un seul | 🟥 aucun match | 🟧 Cosmident sans correspondance (en tête)")
 st.dataframe(styled, use_container_width=True, hide_index=True)
 
 # ==================== Filtres rapides (optionnels) ====================
 st.markdown("**Filtres rapides :**")
-col_f1, col_f2, col_f3 = st.columns(3)
+col_f1, col_f2, col_f3, col_f4 = st.columns(4)
 with col_f1:
-    show_only_both = st.checkbox("Afficher uniquement 🟩 (double match)")
+    show_only_both = st.checkbox("🟩 Double match")
 with col_f2:
-    show_only_one = st.checkbox("Afficher uniquement 🟦 (un seul match)")
+    show_only_one = st.checkbox("🟦 Un seul match")
 with col_f3:
-    show_only_none = st.checkbox("Afficher uniquement 🟥 (aucun match)")
+    show_only_none = st.checkbox("🟥 Aucun match")
+with col_f4:
+    show_only_orphans = st.checkbox("🟧 Orphelins Cosmident")
 
-df_filtered = df_out.copy()
+df_filtered = df_final.copy()
 if show_only_both:
     df_filtered = df_filtered[df_filtered["Statut Global"].str.startswith("🟩")]
 if show_only_one:
     df_filtered = df_filtered[df_filtered["Statut Global"].str.startswith("🟦")]
 if show_only_none:
     df_filtered = df_filtered[df_filtered["Statut Global"].str.startswith("🟥")]
+if show_only_orphans:
+    df_filtered = df_filtered[df_filtered["Statut Global"].str.startswith("🟧")]
 
-if show_only_both or show_only_one or show_only_none:
+if show_only_both or show_only_one or show_only_none or show_only_orphans:
     st.dataframe(df_filtered, use_container_width=True, hide_index=True)
 
 # ==================== 5) TÉLÉCHARGEMENT ====================
-csv_out = df_out.to_csv(index=False, sep=";", encoding="utf-8-sig")
+csv_out = df_final.to_csv(index=False, sep=";", encoding="utf-8-sig")
 st.download_button(
     label="⬇️ Télécharger le tableau fusionné (CSV)",
     data=csv_out,
@@ -499,4 +541,4 @@ st.download_button(
 )
 
 st.divider()
-st.info("Le Résultat est généré automatiquement à partir de l’Excel de facturation (§1). Tu n’as rien d’autre à charger manuellement.")
+st.info("Les lignes Cosmident sans correspondance (ni Résultat, ni Desmos) sont affichées en tête du tableau en 🟧 orange.")
