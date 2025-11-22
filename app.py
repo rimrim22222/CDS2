@@ -9,11 +9,19 @@ import unicodedata
 # --- PDF ---
 try:
     import fitz  # PyMuPDF
-except Exception as e:
+except Exception:
     fitz = None
 
+# --- Fuzzy matching (optionnel) ---
+try:
+    from rapidfuzz import process, fuzz
+    RF_AVAILABLE = True
+except Exception:
+    import difflib
+    RF_AVAILABLE = False
+
 # ==================== CONFIG & LOGO ====================
-st.set_page_config(page_title="Prothèses — Desmos + Cosmident (PDF)", page_icon="tooth", layout="wide")
+st.set_page_config(page_title="Prothèses — Desmos (Excel) + Cosmident (PDF)", page_icon="tooth", layout="wide")
 
 logo_path = Path("logo.png")
 if logo_path.exists():
@@ -23,16 +31,17 @@ else:
     st.caption("Logo manquant → place logo.png à la racine de l’app")
 
 st.title("Gestion des Prothèses — Desmos (Excel) + Cosmident (PDF)")
-st.caption("Comparaison uniquement sur le nom du patient (Acte/€ Cosmident ajoutés).")
+st.caption("Comparaison **uniquement** sur le nom du patient (normalisation + option floue). Ajout des colonnes Cosmident (Acte, €).")
 
 # ==================== SIDEBAR PARAMS ====================
 with st.sidebar:
     st.subheader("Paramètres")
-    debug_desmos = st.toggle("Debug Desmos (lecture des lignes)", value=False)
-    max_debug_rows_desmos = st.number_input("Lignes debug Desmos", min_value=10, max_value=1000, value=150, step=10)
+    # Debug
+    debug_desmos = st.toggle("Debug Desmos (premières lignes)", value=False)
+    max_debug_rows_desmos = st.number_input("Lignes debug Desmos", min_value=10, max_value=2000, value=150, step=10)
 
     debug_pdf = st.toggle("Debug Cosmident PDF (texte des pages)", value=False)
-    max_debug_pages_pdf = st.number_input("Pages debug PDF", min_value=1, max_value=50, value=4, step=1)
+    max_debug_pages_pdf = st.number_input("Pages debug PDF", min_value=1, max_value=100, value=4, step=1)
 
     st.markdown("---")
     st.caption("Filtres Codes (appliqués aux deux sources)")
@@ -43,7 +52,19 @@ with st.sidebar:
     exclude_hbld045 = st.checkbox("Exclure HBLD045", value=True)
 
     st.markdown("---")
-    duplicate_multi_dents = st.checkbox("Dupliquer les actes Cosmident pour dents multiples (11-12)", value=False)
+    st.caption("Cosmident : dents multiples (ex. '11-12')")
+    duplicate_multi_dents = st.checkbox("Dupliquer l'acte pour chaque dent détectée", value=False)
+
+    st.markdown("---")
+    st.caption("Agrégation Cosmident par patient (si plusieurs actes)")
+    cosmident_strategy = st.selectbox("Stratégie", ["Premier acte", "Concat actes", "Somme des tarifs"], index=0)
+
+    st.markdown("---")
+    st.caption("Correspondance par patient")
+    use_fuzzy = st.checkbox("Activer la correspondance floue", value=True)
+    fuzzy_threshold = st.slider("Seuil de similarité (0–100)", min_value=50, max_value=100, value=85, step=1)
+
+    st.markdown("---")
     search_text = st.text_input("Recherche plein texte (toutes colonnes)", "")
 
 # ==================== UPLOADS ====================
@@ -55,13 +76,26 @@ with col_up2:
 
 # ==================== UTILITAIRES ====================
 def normalize_patient(name: str) -> str:
+    """
+    Normalise le nom patient pour une comparaison robuste :
+    - supprime accents
+    - met en MAJ
+    - supprime ponctuation, double espaces
+    - découpe en tokens et les trie (gère inversion NOM/PRENOM)
+    """
     if not isinstance(name, str):
         name = str(name) if name is not None else ""
-    name = name.strip().upper()
+    # accents -> ascii
     name = unicodedata.normalize("NFD", name)
-    name = "".join(ch for ch in name if unicodedata.category(ch) != "Mn")  # supprime accents
-    name = re.sub(r"\s+", " ", name)
-    return name
+    name = "".join(ch for ch in name if unicodedata.category(ch) != "Mn")
+    # maj, ponctuation -> espaces
+    name = name.upper()
+    name = re.sub(r"[^A-Z ]", " ", name)
+    # tokens -> tri (gère 'DUVAL ERIC' == 'ERIC DUVAL')
+    tokens = [t for t in name.split() if t]
+    tokens.sort()
+    # option: éviter tokens ultra courts isolés (mais on les garde pour ne pas perdre 'DE', 'LE')
+    return " ".join(tokens)
 
 def sanitize_number(val: str) -> str:
     v = str(val).strip().replace(" ", "").replace(",", ".")
@@ -263,6 +297,9 @@ CODE_RE = re.compile(r"\b(HBLD\d{3}|HBMD351|HBLD634)\b", re.I)
 MONEY_RE = re.compile(r"(\d{1,6}[,.]\d{2})")
 
 def detect_patient_pdf(lines, i):
+    """
+    Cherche: 'Patient : NOM PRENOM' ou la ligne MAJ avant 'N° Dossier'
+    """
     m = re.search(r"Patient\s*[:\-]\s*(.+)", lines[i], re.I)
     if m:
         return m.group(1).strip()
@@ -296,6 +333,7 @@ def find_tarif_pdf(lines, i_code):
     return "?"
 
 def find_dent_pdf(lines, i_code):
+    # multiple dents (11-12; 11/12)
     for back in range(1, 6):
         j = i_code - back
         if j >= 0:
@@ -303,6 +341,7 @@ def find_dent_pdf(lines, i_code):
             m_multi = re.search(r"\b(\d{1,2})(?:\s*[-;,/]\s*(\d{1,2}))+\b", cand)
             if m_multi:
                 return cand.strip()
+    # simple dent
     for back in range(1, 6):
         j = i_code - back
         if j >= 0:
@@ -345,7 +384,7 @@ def parse_cosmident_pdf(cosmi_pdf_bytes: bytes,
 
         if debug and pno < max_debug_pages:
             st.write(f"**Cosmident Page {pno+1}/{len(doc)}** — aperçu texte")
-            st.code("\n".join(lines[:120]))
+            st.code("\n".join(lines[:150]))
 
         current_patient = None
         for i, line in enumerate(lines):
@@ -388,7 +427,79 @@ def parse_cosmident_pdf(cosmi_pdf_bytes: bytes,
         df["Tarif_Cosmident_float"] = df["Tarif_Cosmident"].apply(to_float_eu)
     return df
 
-# ==================== PIPELINE (JOINTURE UNIQUEMENT SUR PATIENT) ====================
+# ==================== CORRESPONDANCE UNIQUEMENT PAR PATIENT ====================
+def build_cosmident_agg_by_patient(df_cos: pd.DataFrame, strategy: str) -> pd.DataFrame:
+    """
+    Agrège Cosmident au niveau Patient_norm uniquement.
+    strategy: 'Premier acte' | 'Concat actes' | 'Somme des tarifs'
+    """
+    if df_cos.empty:
+        return pd.DataFrame(columns=["Patient_norm", "Acte_Cosmident", "Tarif_Cosmident", "Nb_actes_Cosmi"])
+
+    if strategy == "Premier acte":
+        df_cos_agg = df_cos.sort_index().groupby("Patient_norm").agg({
+            "Acte_Cosmident": "first",
+            "Tarif_Cosmident": "first"
+        }).reset_index()
+        df_cos_agg["Nb_actes_Cosmi"] = df_cos.groupby("Patient_norm").size().values
+
+    elif strategy == "Concat actes":
+        df_cos_agg = df_cos.groupby("Patient_norm").agg({
+            "Acte_Cosmident": lambda s: " | ".join(map(str, s)),
+            "Tarif_Cosmident": "first",
+            "Tarif_Cosmident_float": "sum"
+        }).reset_index()
+        df_cos_agg["Nb_actes_Cosmi"] = df_cos.groupby("Patient_norm").size().values
+        # Option: garder 'Tarif_Cosmident' du premier acte ; somme dispo via colonne float si besoin
+
+    else:  # Somme des tarifs
+        df_cos_agg = df_cos.groupby("Patient_norm").agg({
+            "Acte_Cosmident": "first",
+            "Tarif_Cosmident_float": "sum"
+        }).reset_index()
+        df_cos_agg["Tarif_Cosmident"] = df_cos_agg["Tarif_Cosmident_float"].map(
+            lambda v: f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", " ")
+        )
+        df_cos_agg["Nb_actes_Cosmi"] = df_cos.groupby("Patient_norm").size().values
+
+    df_cos_agg.rename(columns={"Tarif_Cosmident_float": "Total_Cosmi_float"}, inplace=True)
+    return df_cos_agg
+
+def fuzzy_match_patients(des_keys, cos_keys, threshold=85):
+    """
+    Retourne un dict {des_key: matched_cos_key or None} + DataFrame des scores.
+    Utilise RapidFuzz si disponible, sinon difflib.
+    """
+    mapping = {}
+    rows = []
+    cos_list = list(cos_keys)
+
+    for dk in des_keys:
+        best_key = None
+        best_score = 0
+
+        if RF_AVAILABLE:
+            match = process.extractOne(dk, cos_list, scorer=fuzz.token_sort_ratio)
+            if match:
+                best_key, best_score, _ = match
+        else:
+            # difflib ratio 0..1 -> 0..100
+            match = difflib.get_close_matches(dk, cos_list, n=1, cutoff=0.0)
+            if match:
+                best_key = match[0]
+                best_score = int(difflib.SequenceMatcher(None, dk, best_key).ratio() * 100)
+
+        if best_score >= threshold:
+            mapping[dk] = best_key
+        else:
+            mapping[dk] = None
+
+        rows.append({"Patient_norm_Desmos": dk, "Match_Cosmi": best_key or "", "Score": best_score})
+
+    df_scores = pd.DataFrame(rows).sort_values(by="Score", ascending=False)
+    return mapping, df_scores
+
+# ==================== PIPELINE ====================
 if desmos_file and cosmi_pdf:
     # --- DESMOS ---
     df_des = parse_desmos_excel(desmos_file,
@@ -419,19 +530,52 @@ if desmos_file and cosmi_pdf:
                                  duplicate_multi_dents=duplicate_multi_dents,
                                  debug=debug_pdf, max_debug_pages=max_debug_pages_pdf)
 
-    # --- Agrégation Cosmident par NOM PATIENT UNIQUEMENT ---
-    if not df_cos.empty:
-        # On agrège par patient normalisé, et on garde le premier acte + premier tarif.
-        df_cos_agg = df_cos.sort_index().groupby("Patient_norm").agg({
-            "Acte_Cosmident": "first",
-            "Tarif_Cosmident": "first"
-        }).reset_index()
-        df_cos_agg["Nb_actes_Cosmi"] = df_cos.groupby("Patient_norm").size().values
-    else:
-        df_cos_agg = pd.DataFrame(columns=["Patient_norm", "Acte_Cosmident", "Tarif_Cosmident", "Nb_actes_Cosmi"])
+    # --- Agrégation Cosmident par NOM PATIENT uniquement ---
+    df_cos_agg = build_cosmident_agg_by_patient(df_cos, cosmident_strategy)
 
-    # --- Jointure sur Patient_norm uniquement ---
-    df_merge = df_des.merge(df_cos_agg, on="Patient_norm", how="left")
+    # --- Jointure stricte par Patient_norm (exacte) ---
+    df_des["Patient_norm"] = df_des["Patient"].map(normalize_patient)
+    df_merge = df_des.merge(df_cos_agg, left_on="Patient_norm", right_on="Patient_norm", how="left")
+    df_merge["Cosmident_match_exact"] = df_merge["Acte_Cosmident"].notna()
+
+    # --- Correspondance floue (optionnel) ---
+    df_scores = pd.DataFrame(columns=["Patient_norm_Desmos", "Match_Cosmi", "Score"])
+    if use_fuzzy and not df_cos_agg.empty:
+        des_keys = df_des["Patient_norm"].unique().tolist()
+        cos_keys = df_cos_agg["Patient_norm"].unique().tolist()
+        mapping, df_scores = fuzzy_match_patients(des_keys, cos_keys, threshold=fuzzy_threshold)
+
+        # Applique mapping uniquement pour ceux sans match exact
+        no_exact_mask = ~df_merge["Cosmident_match_exact"]
+        df_no_exact = df_merge[no_exact_mask].copy()
+
+        # Prepare dict -> Series pour merge
+        df_map = pd.DataFrame({
+            "Patient_norm": list(mapping.keys()),
+            "Cosmident_norm_mapped": [mapping[k] for k in mapping.keys()]
+        })
+
+        # Ajoute clé mappée
+        df_no_exact = df_no_exact.merge(df_map, on="Patient_norm", how="left")
+
+        # Merge flou vers agg Cosmident
+        df_no_exact = df_no_exact.merge(
+            df_cos_agg.rename(columns={"Patient_norm": "Cosmident_norm_mapped"}),
+            on="Cosmident_norm_mapped",
+            how="left",
+            suffixes=("", "_fuzzy")
+        )
+
+        # Remplit champs manquants par fuzzy
+        for col in ["Acte_Cosmident", "Tarif_Cosmident", "Nb_actes_Cosmi"]:
+            df_no_exact[col] = df_no_exact[col].fillna(df_no_exact[f"{col}_fuzzy"])
+
+        # Re-intègre dans df_merge
+        df_merge.loc[no_exact_mask, ["Acte_Cosmident", "Tarif_Cosmident", "Nb_actes_Cosmi"]] = \
+            df_no_exact[["Acte_Cosmident", "Tarif_Cosmident", "Nb_actes_Cosmi"]].values
+
+    # --- Indicateur final de match (exact ou flou) ---
+    df_merge["Cosmident_match"] = df_merge["Acte_Cosmident"].notna()
 
     # --- Recherche plein texte ---
     if search_text.strip():
@@ -443,15 +587,17 @@ if desmos_file and cosmi_pdf:
                 mask |= df_merge[c].astype(str).str.lower().str.contains(q, na=False)
         df_merge = df_merge[mask].copy()
 
-    # --- Indicateur de match ---
-    df_merge["Cosmident_match"] = df_merge["Acte_Cosmident"].notna()
-
-    # --- Affichage ---
+    # --- Affichage principal ---
     affichage_cols = ["Patient", "Dent", "Code", "Acte", "Tarif", "Acte_Cosmident", "Tarif_Cosmident", "Nb_actes_Cosmi", "Cosmident_match"]
     affichage_cols = [c for c in affichage_cols if c in df_merge.columns]
-
     st.success(f"**{len(df_merge)} actes rapprochés (jointure par NOM PATIENT)**")
     st.dataframe(df_merge[affichage_cols], use_container_width=True, hide_index=True)
+
+    # --- Tableau des scores (si fuzzy activé) ---
+    if use_fuzzy and not df_scores.empty:
+        st.subheader("Scores de correspondance floue (par patient normalisé)")
+        st.caption("Token-sort ratio (RapidFuzz si disponible, sinon approximation via difflib).")
+        st.dataframe(df_scores, use_container_width=True, hide_index=True)
 
     # --- Exports ---
     csv = df_merge[affichage_cols].to_csv(index=False, sep=";", encoding="utf-8-sig")
@@ -470,7 +616,6 @@ if desmos_file and cosmi_pdf:
     ).reset_index()
     recap["Total (€)"] = recap["Total_float"].map(lambda v: f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", " "))
     recap = recap[["Patient", "Actes", "Total (€)", "Cosmident_trouvé"]]
-
     st.subheader("Récapitulatif par patient (Desmos, match Cosmident oui/non)")
     st.dataframe(recap, use_container_width=True, hide_index=True)
 
