@@ -1,284 +1,551 @@
+
 import streamlit as st
-import fitz  # PyMuPDF
-import re
 import pandas as pd
-from PIL import Image
-import pytesseract
-import io
+import re
+from pathlib import Path
+from io import BytesIO
+import unicodedata
 
-st.set_page_config(page_title="Analyse Cosmident + Desmos", layout="wide")
-st.title("📄 Analyse des actes dentaires Cosmident + Desmos")
+# --- PDF ---
+try:
+    import fitz  # PyMuPDF
+except Exception as e:
+    fitz = None
 
-uploaded_cosmident = st.file_uploader(
-    "Upload le fichier Cosmident (PDF ou image)", type=["pdf", "png", "jpg", "jpeg"]
-)
-uploaded_desmos = st.file_uploader(
-    "Upload le fichier Desmos (PDF)", type=["pdf"], key="desmos"
-)
+# ==================== CONFIG & LOGO ====================
+st.set_page_config(page_title="Prothèses — Desmos + Cosmident (PDF)", page_icon="tooth", layout="wide")
 
-# =====================
-# 🔹 Extraction image
-# =====================
-def extract_text_from_image(image):
-    return pytesseract.image_to_string(image)
+logo_path = Path("logo.png")
+if logo_path.exists():
+    st.image(str(logo_path), width=200)
+else:
+    st.image("https://scontent-mrs2-1.xx.fbcdn.net/v/t39.30808-6/305157485_519313286862181_9045589531882558278_n.png?_nc_cat=100&ccb=1-7&_nc_sid=6ee11a&_nc_ohc=WmCLobUhHXQQ7kNvwG_zWEI&_nc_oc=AdmF6xVu1OGEDHjp38eLgP6dtj_6hX5t4xOgz62mTkiw5CGLqZ7l_9EfyAEsQxrkpg4&_nc_zt=23&_nc_ht=scontent-mrs2-1.xx&_nc_gid=TmQOYLQQlH7bir12EkULdA&oh=00_AfiQ_BGtg7ADnPgQAPRIKAB1u1GCtPvDMuPhikiTouGQHg&oe=6927DD2F", width=200)
+    st.caption("Logo manquant → place logo.png à la racine de l’app")
 
-# =====================
-# 🔹 Extraction Cosmident robuste
-# =====================
-def extract_data_from_cosmident(file):
-    file_bytes = file.read()
-    if file.type == "application/pdf":
-        try:
-            doc = fitz.open(stream=file_bytes, filetype="pdf")
-        except Exception as e:
-            st.error(f"Erreur ouverture PDF : {e}")
-            return pd.DataFrame()
-        full_text = ""
-        for page in doc:
-            page_text = page.get_text("text")
-            # Coupe tout ce qui est après les mentions du bas de page
-            stop_pattern = r"(COSMIDENT|IBAN|Siret|BIC|Tél\.|Total \(Euros\)|TOTAL TTC|Règlement|Chèque|NOS COORDONNÉES BANCAIRES)"
-            page_text = re.split(stop_pattern, page_text, flags=re.IGNORECASE)[0]
-            full_text += page_text + "\n"
-    else:
-        try:
-            image = Image.open(io.BytesIO(file_bytes))
-            full_text = extract_text_from_image(image)
-        except Exception as e:
-            st.error(f"Erreur lecture image : {e}")
-            return pd.DataFrame()
-    
-    # Option débogage : aperçu du texte brut
-    with st.expander("🧩 Aperçu du texte extrait (Cosmident brut)"):
-        st.write(full_text[:2000])
-    
-    # Nettoyage du texte : on n’élimine pas les Ref ou Bon
-    lines = full_text.split("\n")
-    clean_lines = []
-    for line in lines:
-        line = line.strip()
-        if not line:
+st.title("Gestion des Prothèses — Desmos (Excel) + Cosmident (PDF)")
+st.caption("Extraction HBLDxxx / HBMD351 / HBLD634, rapprochement et export Excel stylé")
+
+# ==================== SIDEBAR PARAMS ====================
+with st.sidebar:
+    st.subheader("Paramètres")
+    # Debug
+    debug_desmos = st.toggle("Debug Desmos (lecture des lignes)", value=False)
+    max_debug_rows_desmos = st.number_input("Lignes debug Desmos", min_value=10, max_value=1000, value=150, step=10)
+
+    debug_pdf = st.toggle("Debug Cosmident PDF (texte des pages)", value=False)
+    max_debug_pages_pdf = st.number_input("Pages à afficher en debug PDF", min_value=1, max_value=50, value=4, step=1)
+
+    st.markdown("---")
+    st.caption("Filtres Codes (appliqués aux résultats Desmos et Cosmident)")
+    keep_hbmd351 = st.checkbox("Conserver HBMD351", value=True)
+    keep_hbld634 = st.checkbox("Conserver HBLD634", value=True)
+    keep_all_hbld = st.checkbox("Conserver tous les HBLD*", value=True)
+
+    exclude_hbld490 = st.checkbox("Exclure HBLD490 (transitoire)", value=True)
+    exclude_hbld045 = st.checkbox("Exclure HBLD045", value=True)
+
+    st.markdown("---")
+    st.caption("Clé de rapprochement")
+    join_key = st.radio("Choix de la clé", ["Patient", "Patient + Dent", "Patient + Code"], index=0)
+
+    st.caption("Stratégie Cosmident si plusieurs actes sur la même clé")
+    cosmident_strategy = st.selectbox("Stratégie multi-lignes", ["Premier acte", "Concat actes", "Somme des tarifs"], index=0)
+
+    st.caption("Dents multiples (ex. '11-12')")
+    duplicate_multi_dents = st.checkbox("Dupliquer l'acte pour chaque dent détectée", value=False)
+
+    st.markdown("---")
+    search_text = st.text_input("Recherche plein texte (toutes colonnes)", "")
+
+# ==================== UPLOADS ====================
+col_up1, col_up2 = st.columns(2)
+with col_up1:
+    desmos_file = st.file_uploader("Excel Desmos (xls/xlsx)", type=["xls", "xlsx"], key="desmos")
+with col_up2:
+    cosmi_pdf = st.file_uploader("PDF Cosmident", type=["pdf"], key="cosmi_pdf")
+
+# ==================== UTILITAIRES ====================
+def normalize_patient(name: str) -> str:
+    if not isinstance(name, str):
+        name = str(name) if name is not None else ""
+    name = name.strip().upper()
+    name = unicodedata.normalize("NFD", name)
+    name = "".join(ch for ch in name if unicodedata.category(ch) != "Mn")  # supprime accents
+    name = re.sub(r"\s+", " ", name)
+    return name
+
+def sanitize_number(val: str) -> str:
+    v = str(val).strip().replace(" ", "").replace(",", ".")
+    if re.match(r"^\d{1,6}(\.\d{1,2})?$", v):
+        return v.replace(".", ",")
+    return "?"
+
+def to_float_eu(x):
+    try:
+        if isinstance(x, str):
+            x = x.replace(" ", "").replace(",", ".")
+        return float(x)
+    except Exception:
+        return 0.0
+
+def style_dataframe_to_excel(df: pd.DataFrame, money_columns=None, sheet_name="Actes") -> BytesIO:
+    from openpyxl.styles import PatternFill, Font, Alignment, numbers
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+        ws = writer.book[sheet_name]
+        header_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
+        header_font = Font(color="FFFFFF", bold=True)
+        center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = center
+        ws.auto_filter.ref = ws.dimensions
+        for col in ws.columns:
+            max_len = 0
+            letter = col[0].column_letter
+            for cell in col:
+                v = str(cell.value) if cell.value is not None else ""
+                max_len = max(max_len, len(v))
+            ws.column_dimensions[letter].width = min(max_len + 2, 60)
+        if money_columns:
+            money_fmt = numbers.FORMAT_CURRENCY_EUR_SIMPLE
+            for col_name in money_columns:
+                if col_name in df.columns:
+                    idx = list(df.columns).index(col_name) + 1
+                    for row in ws.iter_rows(min_row=2, min_col=idx, max_col=idx, max_row=ws.max_row):
+                        for cell in row:
+                            try:
+                                if isinstance(cell.value, str) and re.match(r"^\d{1,6}([,]\d{1,2})?$", cell.value):
+                                    cell.value = float(cell.value.replace(",", "."))
+                                cell.number_format = money_fmt
+                            except Exception:
+                                pass
+    output.seek(0)
+    return output
+
+def style_summary_to_excel(df_sum: pd.DataFrame, sheet_name="Récap") -> BytesIO:
+    from openpyxl.styles import PatternFill, Font, Alignment, numbers
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df_sum.to_excel(writer, index=False, sheet_name=sheet_name)
+        ws = writer.book[sheet_name]
+        header_fill = PatternFill(start_color="2F528F", end_color="2F528F", fill_type="solid")
+        header_font = Font(color="FFFFFF", bold=True)
+        center = Alignment(horizontal="center", vertical="center")
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = center
+        ws.auto_filter.ref = ws.dimensions
+        for col in ws.columns:
+            max_len = 0
+            letter = col[0].column_letter
+            for cell in col:
+                v = str(cell.value) if cell.value is not None else ""
+                max_len = max(max_len, len(v))
+            ws.column_dimensions[letter].width = min(max_len + 2, 50)
+        if "Total (€)" in df_sum.columns:
+            idx = list(df_sum.columns).index("Total (€)") + 1
+            for row in ws.iter_rows(min_row=2, min_col=idx, max_col=idx, max_row=ws.max_row):
+                for cell in row:
+                    try:
+                        if isinstance(cell.value, str) and re.match(r"^\d{1,6}([,]\d{1,2})?$", cell.value):
+                            cell.value = float(cell.value.replace(",", "."))
+                        cell.number_format = numbers.FORMAT_CURRENCY_EUR_SIMPLE
+                    except Exception:
+                        pass
+    output.seek(0)
+    return output
+
+# ==================== PARSING DESMOS (Excel) ====================
+def is_header_line(text_upper: str) -> bool:
+    patterns = [
+        r"^DATE[\s:]", r"^N°\s*FACT", r"^DENT\(S\)", r"^ACTE$", r"^HONO", r"^AMO$",
+        r"^TOTAL DES FACTURES", r"^IMPRIMÉ LE"
+    ]
+    return any(re.search(p, text_upper) for p in patterns)
+
+def detect_patient_desmos(row_text: str):
+    m = re.search(r"([A-ZÉÈÊËÀÂÄÔÖÙÛÜÇ][A-ZÉÈÊËÀÂÄÔÖÙÛÜÇ'\- ]{4,80})\s+N°\s*Dossier", row_text, re.I)
+    return m.group(1).strip() if m else None
+
+def find_code_cell(values):
+    for i, cell in enumerate(values):
+        cell = str(cell).strip()
+        if not cell:
             continue
-        if re.search(r"(teinte|couleur|A[1-3]|B[1-3]|C[1-3]|D[1-3])", line, re.IGNORECASE):
-            continue
-        if re.search(r"(COSMIDENT|IBAN|Siret|BIC|€|TOTAL TTC|CHÈQUE)", line, re.IGNORECASE):
-            continue
-        clean_lines.append(line)
-    
+        if cell.startswith("HBLD") or cell in ["HBMD351", "HBLD634"]:
+            return cell, i
+    return None, -1
+
+def find_tarif_right(values, code_idx, span=5):
+    for offset in range(1, span+1):
+        j = code_idx + offset
+        if j < len(values):
+            v = sanitize_number(values[j])
+            if v != "?":
+                return v
+    return "?"
+
+def find_dent_left(values, code_idx, span=25):
+    for i in range(code_idx - 1, max(-1, code_idx - span), -1):
+        m = re.search(r"\b([1-4]?\d)\b", str(values[i]))
+        if m:
+            n = int(m.group(1))
+            if 1 <= n <= 48:
+                return str(n).zfill(2)
+    return "?"
+
+def find_acte_left(values, code_idx, span=40):
+    for i in range(code_idx - 1, max(-1, code_idx - span), -1):
+        v = str(values[i]).strip()
+        if v and v.lower() not in ["nan", "none", ""]:
+            return v
+    return "?"
+
+def parse_desmos_excel(desmos_file, debug=False, max_debug_rows=150,
+                       exclude_hbld490=True, exclude_hbld045=True):
+    try:
+        df_raw = pd.read_excel(
+            desmos_file, header=None,
+            engine="openpyxl" if desmos_file.name.endswith(".xlsx") else "xlrd"
+        )
+    except Exception as e:
+        st.error(f"Erreur de lecture Desmos : {e}")
+        return pd.DataFrame()
+
     results = []
     current_patient = None
-    current_description = ""
-    current_numbers = []
-    i = 0
-    while i < len(clean_lines):
-        line = clean_lines[i]
-        i += 1
-        # Détection robuste du patient
-        ref_match = re.search(
-            r"Ref\.?\s*(?:Patient\s*)?:?\s*([\w\s\-]+)",
-            line,
-            re.IGNORECASE,
-        )
-        if ref_match:
-            # Append previous act if any
-            if current_patient and current_description and len(current_numbers) > 0:
-                try:
-                    total = float(current_numbers[-1])
-                    if total > 0:
-                        results.append(
-                            {
-                                "Patient": current_patient,
-                                "Acte Cosmident": current_description.strip(),
-                                "Prix Cosmident": f"{total:.2f}",
-                            }
-                        )
-                except ValueError:
-                    pass
-            current_description = ""
-            current_numbers = []
-            current_patient = ref_match.group(1).strip()
+
+    for idx, row in df_raw.iterrows():
+        row = row.astype(str).str.strip()
+        values = [str(v).strip() for v in row.tolist()]
+        row_text = " ".join([v for v in values if v and v.lower() not in ["nan", "none", ""]])
+
+        if debug and idx < max_debug_rows:
+            st.write(f"**Desmos Ligne {idx}** | Patient courant : {current_patient or '(aucun)'}")
+            st.code(row_text)
+
+        # Reset bloc totals
+        if re.search(r"Factures et Avoirs\s+CENTRE DE SANTÉ DES LAURIERS", row_text, re.I):
+            current_patient = None
             continue
-        
-        bon_match = re.match(r"Bon n°\d+ du [\w\d/]+.*Prescription \d+", line)
-        if bon_match and i < len(clean_lines):
-            next_line = clean_lines[i].strip()
-            ref_match = re.search(
-                r"Ref\.?\s*(?:Patient\s*)?:?\s*([\w\s\-]+)",
-                next_line,
-                re.IGNORECASE,
-            )
-            if ref_match:
-                # Append previous act if any
-                if current_patient and current_description and len(current_numbers) > 0:
-                    try:
-                        total = float(current_numbers[-1])
-                        if total > 0:
-                            results.append(
-                                {
-                                    "Patient": current_patient,
-                                    "Acte Cosmident": current_description.strip(),
-                                    "Prix Cosmident": f"{total:.2f}",
-                                }
-                            )
-                    except ValueError:
-                        pass
-                current_description = ""
-                current_numbers = []
-                current_patient = ref_match.group(1).strip()
-                i += 1
+
+        m_patient = detect_patient_desmos(row_text)
+        if m_patient:
+            current_patient = m_patient.strip()
+            continue
+
+        if is_header_line(row_text.upper()):
+            continue
+
+        code, code_idx = find_code_cell(values)
+        if not code:
+            continue
+
+        if exclude_hbld490 and code == "HBLD490":
+            continue
+        if exclude_hbld045 and code == "HBLD045":
+            continue
+
+        tarif = find_tarif_right(values, code_idx, span=5)
+        dent = find_dent_left(values, code_idx, span=25)
+        acte = find_acte_left(values, code_idx, span=40)
+
+        if not current_patient:
+            continue
+
+        results.append({
+            "Patient": current_patient,
+            "Dent": dent,
+            "Code": code,
+            "Acte": acte,
+            "Tarif": tarif
+        })
+
+    df = pd.DataFrame(results)
+    if not df.empty:
+        df["Patient_norm"] = df["Patient"].map(normalize_patient)
+        df["Tarif_float"] = df["Tarif"].apply(to_float_eu)
+    return df
+
+# ==================== PARSING COSMIDENT (PDF) ====================
+CODE_RE = re.compile(r"\b(HBLD\d{3}|HBMD351|HBLD634)\b", re.I)
+MONEY_RE = re.compile(r"(\d{1,6}[,.]\d{2})")
+
+def detect_patient_pdf(lines, i):
+    """
+    Cherche: 'Patient : NOM PRENOM' ou la ligne MAJ avant 'N° Dossier'
+    """
+    line = lines[i]
+    m = re.search(r"Patient\s*[:\-]\s*(.+)", line, re.I)
+    if m:
+        return m.group(1).strip()
+
+    # si la ligne contient 'N° Dossier', remonter 1..5 lignes pour un nom MAJUSCULE
+    if re.search(r"N°\s*Dossier", line, re.I):
+        for back in range(1, 6):
+            if i - back >= 0:
+                cand = lines[i - back].strip()
+                if re.match(r"^[A-ZÉÈÊËÀÂÄÔÖÙÛÜÇ][A-ZÉÈÊËÀÂÄÔÖÙÛÜÇ' \-]{4,80}$", cand):
+                    return cand
+    return None
+
+def find_acte_pdf(lines, i_code):
+    """
+    Dernière ligne textuelle non vide avant le code,
+    en évitant une autre ligne 'code' ou un pur nombre.
+    """
+    for back in range(1, 8):
+        j = i_code - back
+        if j >= 0:
+            cand = lines[j].strip()
+            if cand and not CODE_RE.search(cand) and not MONEY_RE.fullmatch(cand.replace(" ", "")):
+                return cand
+    return "?"
+
+def find_tarif_pdf(lines, i_code):
+    """
+    Cherche d'abord sur la ligne du code puis dans les 5 lignes suivantes.
+    """
+    inline = MONEY_RE.findall(lines[i_code].replace(" ", ""))
+    if inline:
+        return inline[0].replace(".", ",")
+    for fwd in range(1, 6):
+        j = i_code + fwd
+        if j < len(lines):
+            m = MONEY_RE.search(lines[j].replace(" ", ""))
+            if m:
+                return m.group(1).replace(".", ",")
+    return "?"
+
+def find_dent_pdf(lines, i_code):
+    """
+    Cherche une dent 1..48 dans les 5 lignes précédentes.
+    Gère '11-12' / '11;12' : retourne '11-12' brut et on duplique plus tard si demandé.
+    """
+    # d'abord pattern multiple
+    for back in range(1, 6):
+        j = i_code - back
+        if j >= 0:
+            cand = lines[j]
+            m_multi = re.search(r"\b(\d{1,2})(?:\s*[-;,/]\s*(\d{1,2}))+\b", cand)
+            if m_multi:
+                return cand.strip()
+    # sinon une seule dent
+    for back in range(1, 6):
+        j = i_code - back
+        if j >= 0:
+            cand = lines[j]
+            m = re.search(r"\b([1-4]?\d)\b", cand)
+            if m:
+                n = int(m.group(1))
+                if 1 <= n <= 48:
+                    return f"{n:02d}"
+    return "?"
+
+def expand_multi_dents(dent_str):
+    """
+    '11-12-13' -> ['11','12','13'] ; '11;12' -> ['11','12'] ; '11/21' -> ['11','21']
+    Retourne [dent_str] si non multiple.
+    """
+    s = str(dent_str)
+    if re.search(r"[-;,/]", s):
+        parts = re.split(r"[-;,/]\s*", s)
+        out = []
+        for p in parts:
+            if p.isdigit():
+                n = int(p)
+                if 1 <= n <= 48:
+                    out.append(f"{n:02d}")
+        return list(dict.fromkeys(out)) if out else [s]
+    return [s]
+
+def parse_cosmident_pdf(cosmi_pdf_bytes: bytes,
+                        exclude_hbld490=True, exclude_hbld045=True,
+                        duplicate_multi_dents=False,
+                        debug=False, max_debug_pages=4):
+    if fitz is None:
+        st.error("PyMuPDF (fitz) n'est pas installé. Installe-le pour parser le PDF Cosmident.")
+        return pd.DataFrame()
+
+    doc = fitz.open(stream=cosmi_pdf_bytes, filetype="pdf")
+    results = []
+
+    for pno in range(len(doc)):
+        page = doc[pno]
+        text = page.get_text("text")
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+        if debug and pno < max_debug_pages:
+            st.write(f"**Cosmident Page {pno+1}/{len(doc)}** — aperçu texte")
+            st.code("\n".join(lines[:120]))
+
+        current_patient = None
+        # balayage
+        for i, line in enumerate(lines):
+            # reset sur blocs totals
+            if re.search(r"Total des Factures et Avoirs|Factures et Avoirs", line, re.I):
+                current_patient = None
                 continue
-        
-        if current_patient is None:
-            continue
-        
-        # Process line for description and numbers
-        this_numbers = re.findall(r"\d+[\.,]\d{2}", line)
-        norm_numbers = [n.replace(",", ".") for n in this_numbers]
-        this_text = re.sub(r"\s*\d+[\.,]\d{2}\s*", " ", line).strip()
-        
-        if this_text:
-            if current_description and len(current_numbers) > 0:
-                try:
-                    total = float(current_numbers[-1])
-                    if total > 0:
-                        results.append(
-                            {
-                                "Patient": current_patient,
-                                "Acte Cosmident": current_description.strip(),
-                                "Prix Cosmident": f"{total:.2f}",
-                            }
-                        )
-                except ValueError:
-                    pass
-                current_description = ""
-                current_numbers = []
-            if current_description:
-                current_description += " " + this_text
-            else:
-                current_description = this_text
-        
-        if norm_numbers:
-            current_numbers.extend(norm_numbers)
-    
-    # Append the last act if any
-    if current_patient and current_description and len(current_numbers) > 0:
-        try:
-            total = float(current_numbers[-1])
-            if total > 0:
-                results.append(
-                    {
-                        "Patient": current_patient,
-                        "Acte Cosmident": current_description.strip(),
-                        "Prix Cosmident": f"{total:.2f}",
-                    }
-                )
-        except ValueError:
-            pass
-    
-    return pd.DataFrame(results)
 
-# =====================
-# 🔹 Extraction Desmos
-# =====================
-def extract_desmos_acts(file):
-    doc = fitz.open(stream=file.read(), filetype="pdf")
-    full_text = ""
-    for page in doc:
-        full_text += page.get_text() + "\n"
-    lines = full_text.split("\n")
-    data = []
-    current_patient = None
-    current_acte = ""
-    current_hono = ""
-    for idx, line in enumerate(lines):
-        patient_match = re.search(
-            r"Ref\. ([A-ZÉÈÇÂÊÎÔÛÄËÏÖÜÀÙa-zéèçâêîôûäëïöüàù\s\-]+)", line
-        )
-        if patient_match:
-            if current_patient and current_acte and current_hono:
-                data.append(
-                    {
-                        "Patient": current_patient,
-                        "Acte Desmos": current_acte.strip(),
-                        "Prix Desmos": current_hono,
-                    }
-                )
-            current_patient = patient_match.group(1).strip()
-            current_acte = ""
-            current_hono = ""
-        elif re.search(
-            r"(BIOTECH|Couronne transvissée|HBL\w+|ZIRCONE|GOUTTIÈRE SOUPLE|EMAX|ONLAY|PLAQUE|ADJONCTION|MONTAGE|DENT RESINE)",
-            line,
-            re.IGNORECASE,
-        ):
-            current_acte = line.strip()
-            current_hono = ""
-        elif "Hono" in line:
-            hono_match = re.search(r"Hono\.?\s*:?\s*([\d,\.]+)", line)
-            if hono_match:
-                current_hono = hono_match.group(1).replace(",", ".")
-        elif current_acte and re.match(r"^\d+[\.,]\d{2}$", line):
-            current_hono = line.replace(",", ".")
-    if current_patient and current_acte and current_hono:
-        data.append(
-            {
-                "Patient": current_patient,
-                "Acte Desmos": current_acte.strip(),
-                "Prix Desmos": current_hono,
-            }
-        )
-    return pd.DataFrame(data)
+            # patient
+            m_pat = detect_patient_pdf(lines, i)
+            if m_pat:
+                current_patient = m_pat
+                continue
 
-# =====================
-# 🔹 Matching Cosmident / Desmos
-# =====================
-def match_patient_and_acte(cosmident_patient, df_desmos):
-    cosmident_parts = set(cosmident_patient.lower().split())
-    for idx, row in df_desmos.iterrows():
-        desmos_patient = row["Patient"]
-        desmos_parts = set(desmos_patient.lower().split())
-        if (
-            cosmident_patient.lower() == desmos_patient.lower()
-            or len(cosmident_parts & desmos_parts) > 0
-        ):
-            return row["Acte Desmos"], row["Prix Desmos"]
-    return "", ""
+            # code
+            m_code = CODE_RE.search(line)
+            if not m_code or not current_patient:
+                continue
 
-# =====================
-# 🔹 Interface principale
-# =====================
-if uploaded_cosmident and uploaded_desmos:
-    # Reset file pointers after reading in functions
-    uploaded_cosmident.seek(0)
-    uploaded_desmos.seek(0)
-    
-    df_cosmident = extract_data_from_cosmident(uploaded_cosmident)
-    df_desmos = extract_desmos_acts(uploaded_desmos)
-    
-    # Affichage pour debug : les 3 tables
-    st.subheader("1. Table issue du fichier PDF Cosmident (originale)")
-    st.dataframe(df_cosmident, use_container_width=True)
-    
-    st.subheader("2. Table issue du fichier PDF Desmos")
-    st.dataframe(df_desmos, use_container_width=True)
-    
-    # Fusion
-    actes_desmos = []
-    prix_desmos = []
-    for patient in df_cosmident["Patient"]:
-        acte, prix = match_patient_and_acte(patient, df_desmos)
-        actes_desmos.append(acte)
-        prix_desmos.append(prix)
-    
-    df_merged = df_cosmident.copy()  # Copie pour ne pas modifier l'original
-    df_merged["Acte Desmos"] = actes_desmos
-    df_merged["Prix Desmos"] = prix_desmos
-    
-    st.subheader("3. Table issue de la fusion")
-    st.dataframe(df_merged, use_container_width=True)
-    
-    st.success(f"✅ Extraction et fusion terminées — {len(df_merged)} actes trouvés")
+            code = m_code.group(1).upper()
+            if exclude_hbld490 and code == "HBLD490":
+                continue
+            if exclude_hbld045 and code == "HBLD045":
+                continue
+
+            acte = find_acte_pdf(lines, i)
+            tarif = find_tarif_pdf(lines, i)
+            dent = find_dent_pdf(lines, i)
+
+            # enregistrement (avec duplication éventuelle)
+            dents_list = expand_multi_dents(dent) if duplicate_multi_dents else [dent]
+            for d in dents_list:
+                results.append({
+                    "Patient": current_patient,
+                    "Dent": d,
+                    "Code": code,
+                    "Acte_Cosmident": acte,
+                    "Tarif_Cosmident": tarif
+                })
+
+    df = pd.DataFrame(results)
+    if not df.empty:
+        df["Patient_norm"] = df["Patient"].map(normalize_patient)
+        df["Tarif_Cosmident_float"] = df["Tarif_Cosmident"].apply(to_float_eu)
+    return df
+
+# ==================== PIPELINE ====================
+if desmos_file and cosmi_pdf:
+    # --- DESMOS ---
+    df_des = parse_desmos_excel(desmos_file,
+                                debug=debug_desmos, max_debug_rows=max_debug_rows_desmos,
+                                exclude_hbld490=exclude_hbld490, exclude_hbld045=exclude_hbld045)
+
+    if df_des.empty:
+        st.warning("Desmos n’a produit aucun acte.")
+        st.stop()
+
+    # Filtres codes Desmos
+    mask = pd.Series(True, index=df_des.index)
+    codes = df_des["Code"].astype(str)
+    if not keep_all_hbld:
+        mask &= ~codes.str.startswith("HBLD")
+    if keep_hbmd351:
+        mask |= (codes == "HBMD351")
+    if keep_hbld634:
+        mask |= (codes == "HBLD634")
+    if keep_all_hbld:
+        mask |= codes.str.startswith("HBLD")
+    df_des = df_des[mask].copy()
+
+    # --- COSMIDENT PDF ---
+    cosmi_pdf_bytes = cosmi_pdf.read()
+    df_cos = parse_cosmident_pdf(cosmi_pdf_bytes,
+                                 exclude_hbld490=exclude_hbld490,
+                                 exclude_hbld045=exclude_hbld045,
+                                 duplicate_multi_dents=duplicate_multi_dents,
+                                 debug=debug_pdf, max_debug_pages=max_debug_pages_pdf)
+    if df_cos.empty:
+        st.warning("Cosmident PDF n’a produit aucune ligne exploitable (PDF peut être scanné / image).")
+
+    # --- CLÉ DE RAPPROCHEMENT ---
+    if join_key == "Patient":
+        df_des["JOIN_KEY"] = df_des["Patient_norm"]
+        df_cos["JOIN_KEY"] = df_cos["Patient_norm"] if not df_cos.empty else ""
+    elif join_key == "Patient + Dent":
+        df_des["JOIN_KEY"] = df_des["Patient_norm"] + "||" + df_des["Dent"].astype(str)
+        if not df_cos.empty:
+            df_cos["JOIN_KEY"] = df_cos["Patient_norm"] + "||" + df_cos["Dent"].astype(str)
+    else:  # Patient + Code
+        df_des["JOIN_KEY"] = df_des["Patient_norm"] + "||" + df_des["Code"].astype(str).str.upper()
+        if not df_cos.empty:
+            df_cos["JOIN_KEY"] = df_cos["Patient_norm"] + "||" + df_cos["Code"].astype(str).str.upper()
+
+    # --- AGRÉGATION COSMIDENT SELON STRATÉGIE ---
+    if not df_cos.empty:
+        if cosmident_strategy == "Premier acte":
+            df_cos_agg = df_cos.sort_index().groupby("JOIN_KEY").agg({
+                "Acte_Cosmident": "first",
+                "Tarif_Cosmident": "first",
+                "Tarif_Cosmident_float": "sum"
+            }).reset_index()
+            df_cos_agg["Nb_actes_Cosmi"] = df_cos.groupby("JOIN_KEY").size().values
+        elif cosmident_strategy == "Concat actes":
+            df_cos_agg = df_cos.groupby("JOIN_KEY").agg({
+                "Acte_Cosmident": lambda s: " | ".join(map(str, s)),
+                "Tarif_Cosmident": "first",
+                "Tarif_Cosmident_float": "sum"
+            }).reset_index()
+            df_cos_agg["Nb_actes_Cosmi"] = df_cos.groupby("JOIN_KEY").size().values
+        else:  # Somme des tarifs
+            df_cos_agg = df_cos.groupby("JOIN_KEY").agg({
+                "Acte_Cosmident": "first",
+                "Tarif_Cosmident_float": "sum"
+            }).reset_index()
+            df_cos_agg["Tarif_Cosmident"] = df_cos_agg["Tarif_Cosmident_float"].map(
+                lambda v: f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", " ")
+            )
+            df_cos_agg["Nb_actes_Cosmi"] = df_cos.groupby("JOIN_KEY").size().values
+        df_cos_agg.rename(columns={"Tarif_Cosmident_float": "Total_Cosmi_float"}, inplace=True)
+    else:
+        df_cos_agg = pd.DataFrame(columns=["JOIN_KEY", "Acte_Cosmident", "Tarif_Cosmident", "Nb_actes_Cosmi", "Total_Cosmi_float"])
+
+    # --- MERGE ---
+    df_merge = df_des.merge(df_cos_agg, on="JOIN_KEY", how="left")
+
+    # --- RECHERCHE PLEIN TEXTE ---
+    if search_text.strip():
+        q = search_text.strip().lower()
+        cols = ["Patient", "Dent", "Code", "Acte", "Tarif", "Acte_Cosmident", "Tarif_Cosmident"]
+        mask = pd.Series(False, index=df_merge.index)
+        for c in cols:
+            if c in df_merge.columns:
+                mask |= df_merge[c].astype(str).str.lower().str.contains(q, na=False)
+        df_merge = df_merge[mask].copy()
+
+    # --- AFFICHAGE ---
+    affichage_cols = ["Patient", "Dent", "Code", "Acte", "Tarif", "Acte_Cosmident", "Tarif_Cosmident", "Nb_actes_Cosmi"]
+    affichage_cols = [c for c in affichage_cols if c in df_merge.columns]
+    st.success(f"**{len(df_merge)} actes rapprochés (Desmos + Cosmident)**")
+    st.dataframe(df_merge[affichage_cols], use_container_width=True, hide_index=True)
+
+    # --- EXPORTS ---
+    csv = df_merge[affichage_cols].to_csv(index=False, sep=";", encoding="utf-8-sig")
+    st.download_button("Télécharger le CSV", data=csv, file_name="Protheses_Desmos_Cosmident.csv", mime="text/csv")
+
+    xls = style_dataframe_to_excel(df_merge[affichage_cols], money_columns=["Tarif", "Tarif_Cosmident"], sheet_name="Actes rapprochés")
+    st.download_button("Télécharger l'Excel (.xlsx)", data=xls, file_name="Protheses_Desmos_Cosmident.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    # --- Récap par patient (Desmos) ---
+    df_merge["Tarif_float"] = df_merge["Tarif"].apply(to_float_eu)
+    recap = df_merge.groupby("Patient").agg(
+        Actes=("Code", "count"),
+        Total_float=("Tarif_float", "sum")
+    ).reset_index()
+    recap["Total (€)"] = recap["Total_float"].map(lambda v: f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", " "))
+    recap = recap[["Patient", "Actes", "Total (€)"]]
+    st.subheader("Récapitulatif par patient (Desmos)")
+    st.dataframe(recap, use_container_width=True, hide_index=True)
+
+    xls_sum = style_summary_to_excel(recap, sheet_name="Récap Desmos")
+    st.download_button("Télécharger le récap patients (.xlsx)", data=xls_sum, file_name="Recap_Desmos_Patients.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
 else:
-    st.info(
-        "Veuillez charger les deux fichiers PDF (Cosmident et Desmos) pour lancer l'analyse."
-    )
+    st.info("Charge **l’Excel Desmos** et **le PDF Cosmident** pour lancer l’extraction.")
