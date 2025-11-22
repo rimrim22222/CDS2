@@ -40,9 +40,7 @@ with st.sidebar:
     )
 
 # ==================== UTILITAIRES NOM (ULTRA-PERMISSIF, corrigés) ====================
-COMMON_WORDS = {
-    "de","du","des","la","le","les","d","l","mr","mme","m","monsieur","madame"
-}
+COMMON_WORDS = {"de","du","des","la","le","les","d","l","mr","mme","m","monsieur","madame"}
 
 def strip_accents(s: str) -> str:
     s_norm = unicodedata.normalize("NFD", str(s))
@@ -64,7 +62,6 @@ def canonical_tokens(name: str) -> list:
     return sorted(toks)  # tri pour ignorer inversion nom/prénom
 
 def levenshtein(a: str, b: str) -> int:
-    """Distance d’édition (programmation dynamique, une ligne mémoire)."""
     if a == b:
         return 0
     n, m = len(a), len(b)
@@ -84,9 +81,6 @@ def levenshtein(a: str, b: str) -> int:
     return prev_row[-1]
 
 def fuzzy_equal(a: str, b: str) -> bool:
-    """
-    Tolère petites fautes: distance d'édition <= FUZZY_REL_ERR * longueur max.
-    """
     if a == b:
         return True
     if not a or not b:
@@ -95,7 +89,6 @@ def fuzzy_equal(a: str, b: str) -> bool:
     return (levenshtein(a, b) / L) <= FUZZY_REL_ERR
 
 def match_tokens_count(ta: list, tb: list) -> int:
-    """Greedy matching de tokens entre deux listes, avec fuzzy_equal, sans doublons côté B."""
     used_b = set()
     k = 0
     for a in ta:
@@ -112,18 +105,10 @@ def core_tokens(tokens: list, n: int = 2) -> list:
     return sorted(tokens, key=len, reverse=True)[:n]
 
 def names_match_permissive(name_a: str, name_b: str) -> tuple[bool, float]:
-    """
-    (match_bool, score) — règles permissives :
-    - couverture k / min(lenA, lenB) >= 0.66
-    - OU k >= 2
-    - OU les 2 tokens cœur d’un nom sont présents dans l’autre (exact ou fuzzy)
-    Score = 0.6 * couverture + 0.4 * jaccard + 0.15 * core_bonus
-    """
     ta = canonical_tokens(name_a)
     tb = canonical_tokens(name_b)
     if not ta or not tb:
         return (False, 0.0)
-
     if set(ta) == set(tb):
         return (True, 1.0)
 
@@ -146,7 +131,6 @@ def names_match_permissive(name_a: str, name_b: str) -> tuple[bool, float]:
     core_bonus = 1.0 if (core_hit(ca, tb) or core_hit(cb, ta)) else 0.0
     score = 0.6 * coverage + 0.4 * jacc + 0.15 * core_bonus
     match = (coverage >= 0.66) or (k >= 2) or (core_bonus > 0.0)
-
     return (match, score)
 
 def make_index(df: pd.DataFrame, col_name: str) -> dict:
@@ -160,21 +144,12 @@ def make_index(df: pd.DataFrame, col_name: str) -> dict:
             idx.setdefault(key, []).append(r)
     return idx
 
-def best_match_row(target_name: str, index: dict, score_threshold: float | None = None):
-    """
-    Cherche le meilleur candidat par score permissif.
-    Retourne la ligne si score >= score_threshold (par défaut : SCORE_THRESHOLD).
-    """
-    if score_threshold is None:
-        score_threshold = SCORE_THRESHOLD
+def best_match_row(target_name: str, index: dict, score_threshold: float):
     target_key = " ".join(canonical_tokens(target_name))
     if not target_key or not index:
         return None
-
-    # priorité: clé exacte
     if target_key in index:
         return index[target_key][0]
-
     best = None
     best_score = 0.0
     for cand_key, rows in index.items():
@@ -182,8 +157,24 @@ def best_match_row(target_name: str, index: dict, score_threshold: float | None 
         if match and score > best_score:
             best = rows[0]
             best_score = score
-
     return best if best_score >= score_threshold else None
+
+# NEW: récupérer TOUTES les correspondances (pas seulement la meilleure)
+def find_all_matches(target_name: str, index: dict, score_threshold: float) -> list[dict]:
+    target_key = " ".join(canonical_tokens(target_name))
+    if not target_key or not index:
+        return []
+    matches = []
+    for cand_key, rows in index.items():
+        match, score = names_match_permissive(target_key, cand_key)
+        if match and score >= score_threshold:
+            matches.extend(rows)  # toutes les lignes pour cette clé
+    # dédoublonnage défensif par conversion en dict immuable (selon colonnes Dispos)
+    if matches:
+        df_tmp = pd.DataFrame(matches)
+        df_tmp = df_tmp.drop_duplicates()
+        return df_tmp.to_dict(orient="records")
+    return []
 
 # ==================== 1) EXTRACTION DES ACTES (Excel de facturation) ====================
 st.subheader("1) Extraction des actes prothétiques (Excel de facturation)")
@@ -496,7 +487,6 @@ index_des = make_index(df_des, "Patient") if not df_des.empty else {}
 index_cos = make_index(df_cos, "Patient") if not df_cos.empty else {}
 
 df_out = df_result.copy()
-
 df_out["Match Desmos"] = False
 df_out["Acte Desmos"] = ""
 df_out["Prix Desmos"] = ""
@@ -582,16 +572,13 @@ def color_row(row):
         base = "background-color: #ffe5b4;"  # orange pâle
     else:
         base = "background-color: #ffd6d6;"  # rouge clair
-
     styles = [base] * len(row)
-
     if "aucun match Desmos" in str(row.get("Statut Desmos", "")):
         try:
             col_idx = df_final.columns.get_loc("Statut Desmos")
             styles[col_idx] = "background-color: #fff3cd;"  # jaune pâle
         except Exception:
             pass
-
     stat_cos = str(row.get("Statut Cosmident", ""))
     if ("aucun match Cosmident" in stat_cos) or ("orphan Cosmident" in stat_cos):
         try:
@@ -599,7 +586,6 @@ def color_row(row):
             styles[col_idx] = "background-color: #ffe5b4;"  # orange pâle
         except Exception:
             pass
-
     return styles
 
 styled = df_final.style.apply(color_row, axis=1)
@@ -607,6 +593,64 @@ styled = df_final.style.apply(color_row, axis=1)
 st.subheader("4) Tableau comparé et coloré")
 st.caption("🟩 match Desmos + Cosmident | 🟦 match d’un seul | 🟥 aucun match | 🟧 Cosmident sans correspondance (en tête)")
 st.dataframe(styled, use_container_width=True, hide_index=True)
+
+# ==================== 4bis) VUE DÉTAILLÉE : TOUTES LES LIGNES TRIÉES PAR TARIF ====================
+st.subheader("4bis) Vue détaillée des correspondances (toutes les lignes, triées par tarif croissant)")
+rows_all = []
+if not df_result.empty:
+    for _, base in df_result.iterrows():
+        p = str(base["Patient"])
+        des_list = find_all_matches(p, index_des, SCORE_THRESHOLD)
+        cos_list = find_all_matches(p, index_cos, SCORE_THRESHOLD)
+
+        # Créer une ligne par correspondance Desmos
+        for r in des_list:
+            prix = str(r.get("Prix Desmos", "")).replace(",", ".")
+            rows_all.append({
+                "Patient": p,
+                "Source": "Desmos",
+                "Dent (Résultat)": str(base.get("Dent", "")),
+                "Code (Résultat)": str(base.get("Code", "")),
+                "Acte (Résultat)": str(base.get("Acte", "")),
+                "Tarif (Résultat)": str(base.get("Tarif", "")),
+                "Acte (Source)": str(r.get("Acte Desmos", "")),
+                "Prix (Source)": str(r.get("Prix Desmos", "")),
+                "Prix_num": pd.to_numeric(prix, errors="coerce"),
+            })
+
+        # Créer une ligne par correspondance Cosmident
+        for r in cos_list:
+            prix = str(r.get("Prix Cosmident", "")).replace(",", ".")
+            rows_all.append({
+                "Patient": p,
+                "Source": "Cosmident",
+                "Dent (Résultat)": str(base.get("Dent", "")),
+                "Code (Résultat)": str(base.get("Code", "")),
+                "Acte (Résultat)": str(base.get("Acte", "")),
+                "Tarif (Résultat)": str(base.get("Tarif", "")),
+                "Acte (Source)": str(r.get("Acte Cosmident", "")),
+                "Prix (Source)": str(r.get("Prix Cosmident", "")),
+                "Prix_num": pd.to_numeric(prix, errors="coerce"),
+            })
+
+if rows_all:
+    df_detailed = pd.DataFrame(rows_all)
+    # Tri par Patient puis prix croissant (avec gestion NaN en fin)
+    df_detailed = df_detailed.sort_values(
+        by=["Patient", "Prix_num", "Source", "Acte (Source)"],
+        ascending=[True, True, True, True]
+    )
+    st.dataframe(df_detailed.drop(columns=["Prix_num"]), use_container_width=True, hide_index=True)
+
+    csv_det = df_detailed.drop(columns=["Prix_num"]).to_csv(index=False, sep=";", encoding="utf-8-sig")
+    st.download_button(
+        "⬇️ Télécharger la vue détaillée (CSV, toutes les lignes triées)",
+        data=csv_det,
+        file_name="VueDetaillee_ToutesLignes_TriPrix.csv",
+        mime="text/csv"
+    )
+else:
+    st.info("Aucune ligne détaillée à afficher (pas de correspondances trouvées).")
 
 # ==================== Filtres rapides (optionnels) ====================
 st.markdown("**Filtres rapides :**")
@@ -633,7 +677,7 @@ if show_only_orphans:
 if show_only_both or show_only_one or show_only_none or show_only_orphans:
     st.dataframe(df_filtered, use_container_width=True, hide_index=True)
 
-# ==================== 5) TÉLÉCHARGEMENT ====================
+# ==================== 5) TÉLÉCHARGEMENT TABLEAU PRINCIPAL ====================
 csv_out = df_final.to_csv(index=False, sep=";", encoding="utf-8-sig")
 st.download_button(
     label="⬇️ Télécharger le tableau fusionné (CSV)",
@@ -643,3 +687,4 @@ st.download_button(
 )
 
 st.divider()
+st.info("La 'Vue détaillée' affiche toutes les correspondances par patient (Cosmident & Desmos), triées par prix croissant. Ajuste la tolérance et le seuil dans la barre latérale pour être plus ou moins permissif.")
