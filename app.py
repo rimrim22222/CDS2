@@ -25,11 +25,11 @@ with col_logo:
         st.caption("Logo manquant → place logo.png à la racine de l’app")
 with col_title:
     st.title("Gestion des Prothèses + Comparaison Cosmident / Desmos")
-    st.caption("Extraction ciblée HBLDxxx, HBMD351, HBLD634 → Matching par patient (tolérant inversion Nom/Prénom, accents, casse)")
+    st.caption("Extraction HBLDxxx, HBMD351, HBLD634 → Matching par patient (tolérant inversion Nom/Prénom, accents, casse)")
 
 st.divider()
 
-# ==================== OUTILS NOM (AJOUT pour matching) ====================
+# ==================== OUTILS NOM (pour matching) ====================
 def strip_accents(s: str) -> str:
     s_norm = unicodedata.normalize("NFD", str(s))
     s_no = "".join(ch for ch in s_norm if unicodedata.category(ch) != "Mn")
@@ -70,9 +70,9 @@ def make_index(df: pd.DataFrame, col_name: str) -> dict:
             idx.setdefault(key, []).append(r)
     return idx
 
-# ==================== 1) EXTRACTION DES ACTES (TON CODE CONSERVÉ) ====================
-st.subheader("1) Extraction des actes prothétiques (Excel)")
-uploaded_facturation = st.file_uploader("📥 Charge ton fichier Excel de facturation", type=["xls", "xlsx"])
+# ==================== 1) EXTRACTION DES ACTES (ton code conservé) ====================
+st.subheader("1) Extraction des actes prothétiques (Excel de facturation)")
+uploaded_facturation = st.file_uploader("📥 Charge le fichier Excel (facturation)", type=["xls", "xlsx"])
 
 df_result = pd.DataFrame()
 if uploaded_facturation:
@@ -127,7 +127,7 @@ if uploaded_facturation:
         if not code:
             continue
 
-        # Ignorer les codes HBLD490 et HBLD045
+        # Ignorer certains codes
         if code in ("HBLD490", "HBLD045"):
             continue
 
@@ -187,8 +187,8 @@ else:
 
 st.divider()
 
-# ==================== 2) EXTRACTIONS COSMIDENT (PDF) & DESMOS (EXCEL) ====================
-st.subheader("2) Charges Cosmident (PDF) et Desmos (Excel) pour la comparaison")
+# ==================== 2) EXTRACTIONS COSMIDENT (PDF) & DESMOS (Excel) ====================
+st.subheader("2) Charge Cosmident (PDF) et Desmos (Excel) pour la comparaison")
 
 col_b, col_c = st.columns(2)
 with col_b:
@@ -196,15 +196,7 @@ with col_b:
 with col_c:
     uploaded_desmos = st.file_uploader("📥 Desmos (Excel)", type=["xls", "xlsx"])
 
-# --- Extraction Cosmident (PDF) : conserve ta logique ---
-def extract_text_from_image(image):
-    # OCR optionnel si un jour tu autorises des images
-    try:
-        import pytesseract
-        return pytesseract.image_to_string(image)
-    except Exception:
-        return ""
-
+# --- Extraction Cosmident (PDF) ---
 def extract_data_from_cosmident(file):
     file_bytes = file.read()
     full_text = ""
@@ -383,7 +375,7 @@ if uploaded_desmos:
 
 st.divider()
 
-# ==================== 3) MATCHING AUTOMATIQUE (sur df_result produit au §1) ====================
+# ==================== 3) MATCHING + STATUTS EXPLICITES ====================
 st.subheader("3) Matching par Patient (Résultat vs Cosmident/Desmos)")
 
 if df_result.empty:
@@ -395,49 +387,107 @@ index_des = make_index(df_des, "Patient") if not df_des.empty else {}
 index_cos = make_index(df_cos, "Patient") if not df_cos.empty else {}
 
 df_out = df_result.copy()
+
+# Flags et champs
 df_out["Match Desmos"] = False
 df_out["Acte Desmos"] = ""
 df_out["Prix Desmos"] = ""
+
 df_out["Match Cosmident"] = False
 df_out["Acte Cosmident"] = ""
 df_out["Prix Cosmident"] = ""
 
+# Statuts détaillés
+df_out["Statut Desmos"] = ""       # "match" ou "aucun match Desmos"
+df_out["Statut Cosmident"] = ""    # "match" ou "aucun match Cosmident"
+df_out["Statut Global"] = ""       # 🟩 / 🟦 / 🟥
+
 for i, row in df_out.iterrows():
     pname = str(row["Patient"])
 
-    # Desmos
+    # ----- Desmos -----
     r_des = best_match_row(pname, index_des, threshold=0.75)
     if r_des is not None:
         df_out.at[i, "Match Desmos"] = True
         df_out.at[i, "Acte Desmos"] = str(r_des.get("Acte Desmos", ""))
         df_out.at[i, "Prix Desmos"] = str(r_des.get("Prix Desmos", ""))
+        df_out.at[i, "Statut Desmos"] = "match"
+    else:
+        df_out.at[i, "Statut Desmos"] = "aucun match Desmos"
 
-    # Cosmident
+    # ----- Cosmident -----
     r_cos = best_match_row(pname, index_cos, threshold=0.75)
     if r_cos is not None:
         df_out.at[i, "Match Cosmident"] = True
         df_out.at[i, "Acte Cosmident"] = str(r_cos.get("Acte Cosmident", ""))
         df_out.at[i, "Prix Cosmident"] = str(r_cos.get("Prix Cosmident", ""))
+        df_out.at[i, "Statut Cosmident"] = "match"
+    else:
+        df_out.at[i, "Statut Cosmident"] = "aucun match Cosmident"
+
+    # ----- Statut global -----
+    both = df_out.at[i, "Match Desmos"] and df_out.at[i, "Match Cosmident"]
+    only_one = df_out.at[i, "Match Desmos"] ^ df_out.at[i, "Match Cosmident"]
+    if both:
+        df_out.at[i, "Statut Global"] = "🟩 match Desmos + Cosmident"
+    elif only_one:
+        df_out.at[i, "Statut Global"] = "🟦 match d’un seul"
+    else:
+        df_out.at[i, "Statut Global"] = "🟥 aucun match"
 
 st.success(f"✅ Matching terminé — {len(df_out)} lignes")
 
 # ==================== 4) MISE EN COULEUR ====================
 def color_row(row):
-    both = row["Match Desmos"] and row["Match Cosmident"]
-    only_one = row["Match Desmos"] ^ row["Match Cosmident"]
-    base = ""
-    if both:
+    # couleur selon Statut Global
+    val = row["Statut Global"]
+    if val.startswith("🟩"):
         base = "background-color: #c6f6d5;"  # vert clair
-    elif only_one:
+    elif val.startswith("🟦"):
         base = "background-color: #cfe8ff;"  # bleu clair
     else:
         base = "background-color: #ffd6d6;"  # rouge clair
-    return [base] * len(row)
+
+    styles = [base] * len(row)
+
+    # surligner colonne Statut Desmos en jaune si "aucun match Desmos"
+    if "aucun match Desmos" in str(row["Statut Desmos"]):
+        col_idx = df_out.columns.get_loc("Statut Desmos")
+        styles[col_idx] = "background-color: #fff3cd;"  # jaune pâle
+
+    # surligner colonne Statut Cosmident en orangé si "aucun match Cosmident"
+    if "aucun match Cosmident" in str(row["Statut Cosmident"]):
+        col_idx = df_out.columns.get_loc("Statut Cosmident")
+        styles[col_idx] = "background-color: #ffe5b4;"  # orange pâle
+
+    return styles
 
 styled = df_out.style.apply(color_row, axis=1)
+
 st.subheader("4) Tableau comparé et coloré")
-st.caption("🟩 match Desmos + Cosmident | 🟦 match d’un seul | 🟥 aucun match")
+st.caption("🟩 match Desmos + Cosmident | 🟦 match d’un seul | 🟥 aucun match — avec indicateurs 'aucun match Desmos' et 'aucun match Cosmident'")
 st.dataframe(styled, use_container_width=True, hide_index=True)
+
+# ==================== Filtres rapides (optionnels) ====================
+st.markdown("**Filtres rapides :**")
+col_f1, col_f2, col_f3 = st.columns(3)
+with col_f1:
+    show_only_both = st.checkbox("Afficher uniquement 🟩 (double match)")
+with col_f2:
+    show_only_one = st.checkbox("Afficher uniquement 🟦 (un seul match)")
+with col_f3:
+    show_only_none = st.checkbox("Afficher uniquement 🟥 (aucun match)")
+
+df_filtered = df_out.copy()
+if show_only_both:
+    df_filtered = df_filtered[df_filtered["Statut Global"].str.startswith("🟩")]
+if show_only_one:
+    df_filtered = df_filtered[df_filtered["Statut Global"].str.startswith("🟦")]
+if show_only_none:
+    df_filtered = df_filtered[df_filtered["Statut Global"].str.startswith("🟥")]
+
+if show_only_both or show_only_one or show_only_none:
+    st.dataframe(df_filtered, use_container_width=True, hide_index=True)
 
 # ==================== 5) TÉLÉCHARGEMENT ====================
 csv_out = df_out.to_csv(index=False, sep=";", encoding="utf-8-sig")
@@ -449,4 +499,4 @@ st.download_button(
 )
 
 st.divider()
-st.info("Le Résultat est généré automatiquement à partir de l’Excel de facturation (§1). Aucune charge manuelle des résultats n’est requise.")
+st.info("Le Résultat est généré automatiquement à partir de l’Excel de facturation (§1). Tu n’as rien d’autre à charger manuellement.")
