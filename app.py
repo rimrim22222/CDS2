@@ -60,7 +60,7 @@ with st.sidebar:
     cosmident_strategy = st.selectbox("Stratégie", ["Premier acte", "Concat actes", "Somme des tarifs"], index=0)
 
     st.markdown("---")
-    st.caption("Correspondance par patient")
+    st.caption("Correspondance par patient (uniquement)")
     use_fuzzy = st.checkbox("Activer la correspondance floue", value=True)
     fuzzy_threshold = st.slider("Seuil de similarité (0–100)", min_value=50, max_value=100, value=85, step=1)
 
@@ -81,7 +81,7 @@ def normalize_patient(name: str) -> str:
     - supprime accents
     - met en MAJ
     - supprime ponctuation, double espaces
-    - découpe en tokens et les trie (gère inversion NOM/PRENOM)
+    - découpe en tokens et les trie (gère inversion NOM/PRÉNOM)
     """
     if not isinstance(name, str):
         name = str(name) if name is not None else ""
@@ -94,7 +94,6 @@ def normalize_patient(name: str) -> str:
     # tokens -> tri (gère 'DUVAL ERIC' == 'ERIC DUVAL')
     tokens = [t for t in name.split() if t]
     tokens.sort()
-    # option: éviter tokens ultra courts isolés (mais on les garde pour ne pas perdre 'DE', 'LE')
     return " ".join(tokens)
 
 def sanitize_number(val: str) -> str:
@@ -111,74 +110,86 @@ def to_float_eu(x):
     except Exception:
         return 0.0
 
+# ==================== EXPORT EXCEL (XLSXWRITER, sans openpyxl) ====================
 def style_dataframe_to_excel(df: pd.DataFrame, money_columns=None, sheet_name="Actes") -> BytesIO:
-    from openpyxl.styles import PatternFill, Font, Alignment, numbers
+    """
+    Exporte un DataFrame en .xlsx avec le moteur xlsxwriter.
+    - En-têtes : fond bleu, texte blanc, gras
+    - Auto-width par colonne
+    - Auto-filter
+    - Format monétaire (€) sur colonnes indiquées
+    """
     output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         df.to_excel(writer, index=False, sheet_name=sheet_name)
-        ws = writer.book[sheet_name]
-        header_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
-        header_font = Font(color="FFFFFF", bold=True)
-        center = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        for cell in ws[1]:
-            cell.fill = header_fill
-            cell.font = header_font
-            cell.alignment = center
-        ws.auto_filter.ref = ws.dimensions
-        for col in ws.columns:
-            max_len = 0
-            letter = col[0].column_letter
-            for cell in col:
-                v = str(cell.value) if cell.value is not None else ""
-                max_len = max(max_len, len(v))
-            ws.column_dimensions[letter].width = min(max_len + 2, 60)
+        workbook  = writer.book
+        worksheet = writer.sheets[sheet_name]
+
+        header_fmt = workbook.add_format({
+            "bold": True, "font_color": "white",
+            "bg_color": "#1F4E79", "align": "center", "valign": "vcenter"
+        })
+        money_fmt = workbook.add_format({"num_format": u'€ #,##0.00'})
+
+        # En-têtes stylées
+        for col_idx, col_name in enumerate(df.columns):
+            worksheet.write(0, col_idx, col_name, header_fmt)
+
+        # Auto-filter sur la plage du tableau
+        worksheet.autofilter(0, 0, len(df), len(df.columns) - 1)
+
+        # Auto-width par colonne
+        for col_idx, col_name in enumerate(df.columns):
+            max_len = max(
+                [len(str(col_name))] + [len(str(v)) if v is not None else 0 for v in df[col_name].tolist()]
+            )
+            worksheet.set_column(col_idx, col_idx, min(max_len + 2, 60))
+
+        # Format € sur colonnes ciblées
         if money_columns:
-            money_fmt = numbers.FORMAT_CURRENCY_EUR_SIMPLE
             for col_name in money_columns:
                 if col_name in df.columns:
-                    idx = list(df.columns).index(col_name) + 1
-                    for row in ws.iter_rows(min_row=2, min_col=idx, max_col=idx, max_row=ws.max_row):
-                        for cell in row:
-                            try:
-                                if isinstance(cell.value, str) and re.match(r"^\d{1,6}([,]\d{1,2})?$", cell.value):
-                                    cell.value = float(cell.value.replace(",", "."))
-                                cell.number_format = money_fmt
-                            except Exception:
-                                pass
+                    col_idx = df.columns.get_loc(col_name)
+                    worksheet.set_column(col_idx, col_idx, None, money_fmt)
+
     output.seek(0)
     return output
 
 def style_summary_to_excel(df_sum: pd.DataFrame, sheet_name="Récap") -> BytesIO:
-    from openpyxl.styles import PatternFill, Font, Alignment, numbers
+    """
+    Exporte un récap en .xlsx (xlsxwriter) avec style d’en-tête, auto-width, auto-filter
+    et format € sur la colonne 'Total (€)' si présente.
+    """
     output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         df_sum.to_excel(writer, index=False, sheet_name=sheet_name)
-        ws = writer.book[sheet_name]
-        header_fill = PatternFill(start_color="2F528F", end_color="2F528F", fill_type="solid")
-        header_font = Font(color="FFFFFF", bold=True)
-        center = Alignment(horizontal="center", vertical="center")
-        for cell in ws[1]:
-            cell.fill = header_fill
-            cell.font = header_font
-            cell.alignment = center
-        ws.auto_filter.ref = ws.dimensions
-        for col in ws.columns:
-            max_len = 0
-            letter = col[0].column_letter
-            for cell in col:
-                v = str(cell.value) if cell.value is not None else ""
-                max_len = max(max_len, len(v))
-            ws.column_dimensions[letter].width = min(max_len + 2, 50)
+        workbook  = writer.book
+        worksheet = writer.sheets[sheet_name]
+
+        header_fmt = workbook.add_format({
+            "bold": True, "font_color": "white",
+            "bg_color": "#2F528F", "align": "center", "valign": "vcenter"
+        })
+        money_fmt = workbook.add_format({"num_format": u'€ #,##0.00'})
+
+        # En-têtes
+        for col_idx, col_name in enumerate(df_sum.columns):
+            worksheet.write(0, col_idx, col_name, header_fmt)
+
+        worksheet.autofilter(0, 0, len(df_sum), len(df_sum.columns) - 1)
+
+        # Auto-width
+        for col_idx, col_name in enumerate(df_sum.columns):
+            max_len = max(
+                [len(str(col_name))] + [len(str(v)) if v is not None else 0 for v in df_sum[col_name].tolist()]
+            )
+            worksheet.set_column(col_idx, col_idx, min(max_len + 2, 50))
+
+        # Format € sur 'Total (€)'
         if "Total (€)" in df_sum.columns:
-            idx = list(df_sum.columns).index("Total (€)") + 1
-            for row in ws.iter_rows(min_row=2, min_col=idx, max_col=idx, max_row=ws.max_row):
-                for cell in row:
-                    try:
-                        if isinstance(cell.value, str) and re.match(r"^\d{1,6}([,]\d{1,2})?$", cell.value):
-                            cell.value = float(cell.value.replace(",", "."))
-                        cell.number_format = numbers.FORMAT_CURRENCY_EUR_SIMPLE
-                    except Exception:
-                        pass
+            col_idx = df_sum.columns.get_loc("Total (€)")
+            worksheet.set_column(col_idx, col_idx, None, money_fmt)
+
     output.seek(0)
     return output
 
@@ -427,7 +438,7 @@ def parse_cosmident_pdf(cosmi_pdf_bytes: bytes,
         df["Tarif_Cosmident_float"] = df["Tarif_Cosmident"].apply(to_float_eu)
     return df
 
-# ==================== CORRESPONDANCE UNIQUEMENT PAR PATIENT ====================
+# ==================== AGRÉGATION COSMIDENT PAR PATIENT ====================
 def build_cosmident_agg_by_patient(df_cos: pd.DataFrame, strategy: str) -> pd.DataFrame:
     """
     Agrège Cosmident au niveau Patient_norm uniquement.
@@ -450,7 +461,6 @@ def build_cosmident_agg_by_patient(df_cos: pd.DataFrame, strategy: str) -> pd.Da
             "Tarif_Cosmident_float": "sum"
         }).reset_index()
         df_cos_agg["Nb_actes_Cosmi"] = df_cos.groupby("Patient_norm").size().values
-        # Option: garder 'Tarif_Cosmident' du premier acte ; somme dispo via colonne float si besoin
 
     else:  # Somme des tarifs
         df_cos_agg = df_cos.groupby("Patient_norm").agg({
@@ -465,6 +475,7 @@ def build_cosmident_agg_by_patient(df_cos: pd.DataFrame, strategy: str) -> pd.Da
     df_cos_agg.rename(columns={"Tarif_Cosmident_float": "Total_Cosmi_float"}, inplace=True)
     return df_cos_agg
 
+# ==================== Fuzzy matching (par patient) ====================
 def fuzzy_match_patients(des_keys, cos_keys, threshold=85):
     """
     Retourne un dict {des_key: matched_cos_key or None} + DataFrame des scores.
@@ -483,7 +494,6 @@ def fuzzy_match_patients(des_keys, cos_keys, threshold=85):
             if match:
                 best_key, best_score, _ = match
         else:
-            # difflib ratio 0..1 -> 0..100
             match = difflib.get_close_matches(dk, cos_list, n=1, cutoff=0.0)
             if match:
                 best_key = match[0]
@@ -549,13 +559,12 @@ if desmos_file and cosmi_pdf:
         no_exact_mask = ~df_merge["Cosmident_match_exact"]
         df_no_exact = df_merge[no_exact_mask].copy()
 
-        # Prepare dict -> Series pour merge
+        # Dict -> DataFrame pour merge
         df_map = pd.DataFrame({
             "Patient_norm": list(mapping.keys()),
             "Cosmident_norm_mapped": [mapping[k] for k in mapping.keys()]
         })
 
-        # Ajoute clé mappée
         df_no_exact = df_no_exact.merge(df_map, on="Patient_norm", how="left")
 
         # Merge flou vers agg Cosmident
